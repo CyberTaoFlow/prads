@@ -41,6 +41,9 @@
 #include "tcp.h"
 #include "dump_dns.h"
 #include "dhcp.h"
+#include <pcap.h>
+#include <pcap/pcap.h>
+#include <pfring.h>
 //#include "output-plugins/log_init.h"
 #include "output-plugins/log.h"
 
@@ -1466,6 +1469,7 @@ int main(int argc, char *argv[])
 
     cxt_init();
     olog("[*] Sniffing...\n");
+    pcap_set_watermark(config.handle, 128);
     pcap_loop(config.handle, -1, got_packet, NULL);
 
     game_over();
