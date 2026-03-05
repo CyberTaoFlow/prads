@@ -1,10 +1,13 @@
 #ifndef SERVICEFP_H
 #define SERVIDEFP_H
 
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+
 void arp_check(char *eth_hdr, time_t tstamp);
 int load_servicefp_file(char *sigfile, signature **db, int);
 int parse_raw_signature(bstring line, int lineno, signature **dbp);
-bstring get_app_name(signature * sig, const uint8_t *payload, int *ovector,
+bstring get_app_name(signature * sig, const uint8_t *payload, pcre2_match_data *match_data,
                      int rc);
 bstring check_port(uint8_t proto, uint16_t port);
 void service_tcp4(packetinfo *pi, signature *db);

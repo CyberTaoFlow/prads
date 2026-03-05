@@ -1,6 +1,7 @@
 /*
 ** Copyright (C) 2009 Redpill Linpro, AS.
 ** Copyright (C) 2009 Edward Fjellskål <edward.fjellskaal@redpill-linpro.com>
+** Copyright (C) 2025 Vectorscan integration
 **
 ** This program is free software; you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License Version 2 as
@@ -19,41 +20,85 @@
 */
 
 #include "../prads.h"
+#include "../config.h"
 #include "../sys_func.h"
 #include "../assets.h"
+#include "../hs_engine.h"
 #include "servicefp.h"
+
+extern globalconfig config;
 extern bstring UNKNOWN;
+
+static int try_sig_match(signature *sig, uint8_t sflags,
+                         const uint8_t *payload, int plen,
+                         bstring *out_app)
+{
+    if (sflags & (HS_SIG_PREFILTER | HS_SIG_CAPTURE)) {
+        if (sig->re == NULL)
+            return 0;
+        int rc = pcre2_match(sig->re, (PCRE2_SPTR)payload, plen,
+                             0, 0, sig->match_data, NULL);
+        if (rc < 0)
+            return 0;
+        if (sflags & HS_SIG_CAPTURE)
+            *out_app = get_app_name(sig, payload, sig->match_data, rc);
+        else
+            *out_app = hs_get_app_name_static(sig);
+        return 1;
+    }
+    *out_app = hs_get_app_name_static(sig);
+    return 1;
+}
 
 void client_tcp4(packetinfo *pi, signature* sig_client_tcp)
 {
-    int rc;                     /* PCRE */
-    int ovector[15];
     int tmplen;
-    signature *tmpsig;
     bstring app, service_name;
 
-    if (pi->plen < PAYLOAD_MIN) return; // if almost no payload - skip
-    /* should make a config.tcp_client_flowdept etc
-     * a range between 500-1000 should be good!
-     */
+    (void)sig_client_tcp;
+
+    if (pi->plen < PAYLOAD_MIN) return;
     if (pi->plen > 600) tmplen = 600;
         else tmplen = pi->plen;
 
-    tmpsig = sig_client_tcp;
-    while (tmpsig != NULL) {
-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char*)pi->payload, tmplen, 0, 0,
-                       ovector, 15);
-        if (rc != -1) {
-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
-            //printf("[*] - MATCH CLIENT IPv4/TCP: %s\n",(char *)bdata(app));
+    if (config.hs_client_tcp == NULL) return;
+
+    hs_match_ctx_t ctx;
+    hs_sigdb_scan(config.hs_client_tcp, (const char *)pi->payload,
+                    tmplen, &ctx);
+
+    for (int i = 0; i < ctx.count; i++) {
+        unsigned int id = ctx.ids[i];
+        if (id >= config.hs_client_tcp->hs_count) continue;
+        signature *tmpsig = config.hs_client_tcp->sig_array[id];
+        if (tmpsig == NULL) continue;
+        uint8_t sflags    = config.hs_client_tcp->sig_flags[id];
+
+        if (try_sig_match(tmpsig, sflags, pi->payload, tmplen, &app)) {
             update_asset_service(pi, tmpsig->service, app);
             pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
             bdestroy(app);
             return;
         }
-        tmpsig = tmpsig->next;
     }
-    // Should have a flag set to resolve unknowns to default service
+
+    for (uint32_t j = 0; j < config.hs_client_tcp->pcre2_only_count; j++) {
+        signature *tmpsig = config.hs_client_tcp->pcre2_only[j];
+        if (tmpsig->re == NULL) continue;
+        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, tmplen,
+                             0, 0, tmpsig->match_data, NULL);
+        if (rc >= 0) {
+            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
+                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
+            else
+                app = hs_get_app_name_static(tmpsig);
+            update_asset_service(pi, tmpsig->service, app);
+            pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
+            bdestroy(app);
+            return;
+        }
+    }
+
     if ( !ISSET_CLIENT_UNKNOWN(pi)
         && (service_name = check_known_port(IP_PROTO_TCP,ntohs(pi->tcph->dst_port))) !=NULL ) {
         update_asset_service(pi, UNKNOWN, service_name);
@@ -64,29 +109,50 @@ void client_tcp4(packetinfo *pi, signature* sig_client_tcp)
 
 void client_tcp6(packetinfo *pi, signature* sig_client_tcp)
 {
-    int rc;                     /* PCRE */
-    int ovector[15];
-    signature *tmpsig;
     bstring app, service_name;
 
-    if (pi->plen < 10) return; // if almost no payload - skip
-    /* should make a config.tcp_client_flowdept etc
-     * a range between 500-1000 should be good!
-     */
-    tmpsig = sig_client_tcp;
-    while (tmpsig != NULL) {
-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char*) pi->payload, pi->plen, 0, 0,
-                       ovector, 15);
-        if (rc != -1) {
-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
-            //printf("[*] - MATCH CLIENT IPv6/TCP: %s\n",(char *)bdata(app));
+    (void)sig_client_tcp;
+
+    if (pi->plen < 10) return;
+
+    if (config.hs_client_tcp == NULL) return;
+
+    hs_match_ctx_t ctx;
+    hs_sigdb_scan(config.hs_client_tcp, (const char *)pi->payload,
+                    pi->plen, &ctx);
+
+    for (int i = 0; i < ctx.count; i++) {
+        unsigned int id = ctx.ids[i];
+        if (id >= config.hs_client_tcp->hs_count) continue;
+        signature *tmpsig = config.hs_client_tcp->sig_array[id];
+        if (tmpsig == NULL) continue;
+        uint8_t sflags    = config.hs_client_tcp->sig_flags[id];
+
+        if (try_sig_match(tmpsig, sflags, pi->payload, pi->plen, &app)) {
             update_asset_service(pi, tmpsig->service, app);
             pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
             bdestroy(app);
             return;
         }
-        tmpsig = tmpsig->next;
     }
+
+    for (uint32_t j = 0; j < config.hs_client_tcp->pcre2_only_count; j++) {
+        signature *tmpsig = config.hs_client_tcp->pcre2_only[j];
+        if (tmpsig->re == NULL) continue;
+        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, pi->plen,
+                             0, 0, tmpsig->match_data, NULL);
+        if (rc >= 0) {
+            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
+                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
+            else
+                app = hs_get_app_name_static(tmpsig);
+            update_asset_service(pi, tmpsig->service, app);
+            pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
+            bdestroy(app);
+            return;
+        }
+    }
+
     if (!ISSET_CLIENT_UNKNOWN(pi)
         && (service_name = check_known_port(IP_PROTO_TCP,ntohs(pi->tcph->dst_port))) !=NULL ) {
         update_asset_service(pi, UNKNOWN, service_name);

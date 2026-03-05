@@ -27,7 +27,9 @@
 #include "common.h"
 #include "bstrlib.h"
 #include <netinet/in.h>
-#include <pcre.h>
+#include <hs/hs.h>
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
 
 /*  D E F I N E S  ************************************************************/
 #ifndef RELEASE
@@ -750,8 +752,11 @@ typedef struct _signature {
         bstring ver;            /* Version */
         bstring misc;           /* Misc info */
     } title;
-    pcre *regex;                /* Signature - Compiled Regular Expression */
-    pcre_extra *study;          /* Studied version of the compiled regex. */
+    pcre2_code *re;              /* PCRE2 compiled pattern (for capture/confirm) */
+    pcre2_match_data *match_data;/* PCRE2 match data block                      */
+    bstring regex_str;           /* Raw regex string (kept for hs compilation)  */
+    uint32_t hs_id;              /* Pattern ID in Vectorscan multi-pattern DB   */
+    uint8_t  hs_flags;           /* hs_sig_flags — prefilter / capture / etc.   */
     struct {                    /* Signature stats */
         uint32_t    checked;    /* How many times the sig has been matched for */
         uint32_t    matched;    /* How many times it has matched*/

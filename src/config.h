@@ -36,6 +36,9 @@
 #define CS_ICMP                       0x20
 #define CS_ARP                        0x80
 
+/* Forward declaration for Vectorscan multi-pattern databases */
+struct _hs_sigdb;
+
 typedef struct _globalconfig {
     pcap_t              *handle;        /* Pointer to libpcap handle */
     struct pcap_stat    ps;             /* libpcap stats */
@@ -80,6 +83,10 @@ typedef struct _globalconfig {
     signature   *sig_serv_udp;          /* Pointer to list of udp service signatures */
     signature   *sig_client_tcp;        /* Pointer to list of tcp client signatures */
     signature   *sig_client_udp;        /* Pointer to list of udp client signatures */
+    struct _hs_sigdb *hs_serv_tcp;      /* Vectorscan DB for tcp service signatures */
+    struct _hs_sigdb *hs_serv_udp;      /* Vectorscan DB for udp service signatures */
+    struct _hs_sigdb *hs_client_tcp;    /* Vectorscan DB for tcp client signatures  */
+    struct _hs_sigdb *hs_client_udp;    /* Vectorscan DB for udp client signatures  */
     fmask       *network[MAX_NETS];     /* Struct for fmask */
     char        *dev;                   /* Device name to use for sniffing */
     char        *chroot_dir;            /* Directory to chroot to */

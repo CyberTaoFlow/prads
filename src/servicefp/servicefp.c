@@ -43,6 +43,7 @@
 #include "../sys_func.h"
 #include "../prads.h"
 #include "../config.h"
+#include "../hs_engine.h"
 #include "servicefp.h"
 
 extern globalconfig config;
@@ -134,9 +135,7 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
     struct bstrList *title = NULL;
     signature *sig, *head;
     sig = head = NULL;
-    bstring pcre_string = NULL;
-    const char *err = NULL;     /* PCRE */
-    int erroffset;              /* PCRE */
+    bstring regex_string = NULL;
     int ret = 0;
     int i;
 
@@ -160,18 +159,18 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
     if (raw_sig->qty < 3) {
         ret = -1;
     } else if (raw_sig->qty > 3) {
-        pcre_string = bstrcpy(raw_sig->entry[2]);
+        regex_string = bstrcpy(raw_sig->entry[2]);
         for (i = 3; i < raw_sig->qty; i++) {
             //bstring tmp = bfromcstr("||");
             bstring tmp = bfromcstr(",");
-            if ((bconcat(pcre_string, tmp)) == BSTR_ERR)
+            if ((bconcat(regex_string, tmp)) == BSTR_ERR)
                 ret = -1;
-            if ((bconcat(pcre_string, raw_sig->entry[i])) == BSTR_ERR)
+            if ((bconcat(regex_string, raw_sig->entry[i])) == BSTR_ERR)
                 ret = -1;
             bdestroy(tmp);
         }
     } else {
-        pcre_string = bstrcpy(raw_sig->entry[2]);
+        regex_string = bstrcpy(raw_sig->entry[2]);
     }
 
     /*
@@ -180,7 +179,7 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
     if (raw_sig->entry[1] != NULL && ret != -1)
         title = bsplit(raw_sig->entry[1], '/');
     if (title == NULL) {
-        bdestroy(pcre_string);
+        bdestroy(regex_string);
         return -1;
     }
     if (title->qty < 3)
@@ -195,30 +194,30 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
         sig->prev = NULL;
         if (raw_sig->entry[0] != NULL)
             sig->service = bstrcpy(raw_sig->entry[0]);
-        if (title->entry[1] != NULL)
+        if (title->qty > 1 && title->entry[1] != NULL)
             sig->title.app = bstrcpy(title->entry[1]);
-        if (title->entry[2] != NULL)
+        if (title->qty > 2 && title->entry[2] != NULL)
             sig->title.ver = bstrcpy(title->entry[2]);
-        if (title->entry[3] != NULL)
+        if (title->qty > 3 && title->entry[3] != NULL)
             sig->title.misc = bstrcpy(title->entry[3]);
 
         /*
-         * PCRE 
+         * Store the raw regex string for later Vectorscan batch compilation.
+         * Pattern compilation into hs_compile_multi + selective PCRE2 happens
+         * in hs_sigdb_compile() after all signatures are loaded.
          */
-        if (pcre_string != NULL) {
-            if ((sig->regex =
-                 pcre_compile((char *)bdata(pcre_string), 0, &err,
-                              &erroffset, NULL)) == NULL) {
-                printf("Unable to compile signature:  %s at line %d (%s)",
-                       err, lineno, bdata(line));
+        if (regex_string != NULL) {
+            sig->regex_str = bstrcpy(regex_string);
+            if (sig->regex_str == NULL) {
+                printf("Unable to copy regex string at line %d (%s)",
+                       lineno, bdata(line));
                 ret = -1;
             }
         }
-        if (ret != -1) {
-            sig->study = pcre_study(sig->regex, 0, &err);
-            if (err != NULL)
-                printf("Unable to study signature:  %s", err);
-        }
+        sig->re = NULL;
+        sig->match_data = NULL;
+        sig->hs_id = 0;
+        sig->hs_flags = 0;
 
         /*
          * Add signature to 'signature_list' data structure. 
@@ -237,8 +236,8 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
         bstrListDestroy(raw_sig);
     if (title != NULL)
         bstrListDestroy(title);
-    if (pcre_string != NULL)
-        bdestroy(pcre_string);
+    if (regex_string != NULL)
+        bdestroy(regex_string);
 
     return ret;
 }
@@ -266,8 +265,9 @@ void free_signature_list (signature *head)
             bdestroy(head->title.app);
             bdestroy(head->title.ver);
             bdestroy(head->title.misc);
-            if (head->regex != NULL) free(head->regex);
-            if (head->study != NULL) free(head->study);
+            bdestroy(head->regex_str);
+            if (head->match_data != NULL) pcre2_match_data_free(head->match_data);
+            if (head->re != NULL) pcre2_code_free(head->re);
             tmp = head->next;
             free(head);
             head = NULL;
@@ -292,74 +292,70 @@ void del_signature_lists()
 /* ----------------------------------------------------------
  * FUNCTION     : get_app_name
  * DESCRIPTION  : This function will take the results of a
- *              : pcre match and compile the application name
+ *              : PCRE2 match and compile the application name
  *              : based off of the signature.
  * INPUT        : 0 - Signature Pointer
  *              : 1 - payload
- *              : 2 - ovector
- *              : 3 - rc (return from pcre_exec)
+ *              : 2 - pcre2_match_data (contains ovector)
+ *              : 3 - rc (return from pcre2_match)
  * RETURN       : processed app name
  * ---------------------------------------------------------- */
 bstring get_app_name(signature * sig,
-                     const uint8_t *payload, int *ovector, int rc)
+                     const uint8_t *payload, pcre2_match_data *match_data, int rc)
 {
     char sub[512];
     char app[5000];
-    const char *expr;
-    bstring retval;
+    const char *p;
     int i = 0;
-    int n = 0;
-    int x = 0;
     int z = 0;
 
+    (void)payload; /* accessed indirectly through match_data */
+
     /*
-     * Create Application string using the values in signature[i].title.  
+     * Create Application string using the values in signature[i].title.
+     * bdata() is captured into a local to satisfy GCC nonnull analysis.
      */
-    if (sig->title.app != NULL) {
-        strncpy(app, bdata(sig->title.app), MAX_APP);
+    app[0] = '\0';
+    if (sig->title.app != NULL && (p = bdata(sig->title.app)) != NULL) {
+        strncpy(app, p, MAX_APP);
     }
     if (sig->title.ver != NULL) {
-        if (sig->title.ver->slen > 0) {
+        if (sig->title.ver->slen > 0
+            && (p = (const char *)bdata(sig->title.ver)) != NULL) {
             strcat(app, " ");
-            strncat(app, (char *)bdata(sig->title.ver), MAX_VER);
+            strncat(app, p, MAX_VER);
         }
     }
     if (sig->title.misc != NULL) {
-        if (sig->title.misc->slen > 0) {
+        if (sig->title.misc->slen > 0
+            && (p = (const char *)bdata(sig->title.misc)) != NULL) {
             strcat(app, " (");
-            strncat(app, (char *)bdata(sig->title.misc), MAX_MISC);
+            strncat(app, p, MAX_MISC);
             strcat(app, ")");
         }
     }
 
     /*
-     * Replace $1, $2, etc. with the appropriate substring.  
+     * Replace $1, $2, etc. with the appropriate PCRE2 substring.  
      */
-    while (app[i] != '\0' && z < (sizeof(sub) - 1)) {
-        /*
-         * Check to see if the string contains a $? mark variable. 
-         */
+    while (app[i] != '\0' && z < (int)(sizeof(sub) - 1)) {
         if (app[i] == '$') {
-            /*
-             * Yes it does, replace it with the appropriate match string. 
-             */
             i++;
-            n = atoi(&app[i]);
+            int n = atoi(&app[i]);
 
-            pcre_get_substring((const char *)payload, ovector, rc, n, &expr);
-            x = 0;
-            while (expr[x] != '\0' && z < (sizeof(sub) - 1)) {
-                sub[z] = expr[x];
-                z++;
-                x++;
+            if (n >= 0 && n < rc) {
+                PCRE2_UCHAR *expr = NULL;
+                PCRE2_SIZE exprlen = 0;
+                int ret = pcre2_substring_get_bynumber(
+                              match_data, (uint32_t)n, &expr, &exprlen);
+                if (ret == 0 && expr != NULL) {
+                    for (PCRE2_SIZE x = 0; x < exprlen && z < (int)(sizeof(sub) - 1); x++)
+                        sub[z++] = (char)expr[x];
+                    pcre2_substring_free(expr);
+                }
             }
-            pcre_free_substring (expr);
-            expr = NULL;
             i++;
         } else {
-            /*
-             * No it doesn't, copy to new string. 
-             */
             sub[z] = app[i];
             i++;
             z++;
@@ -367,9 +363,7 @@ bstring get_app_name(signature * sig,
     }
     sub[z] = '\0';
 
-    retval = bfromcstr(sub);
-    return retval;
-
+    return bfromcstr(sub);
 }
 
 void load_known_ports_file(char *filename, port_t *lports)

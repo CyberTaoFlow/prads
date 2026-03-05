@@ -36,6 +36,7 @@
 #include "cxt.h"
 #include "ipfp/ipfp.h"
 #include "servicefp/servicefp.h"
+#include "hs_engine.h"
 #include "sig.h"
 #include "mac.h"
 #include "tcp.h"
@@ -1058,6 +1059,13 @@ void game_over()
         clear_asset_list();
         end_all_sessions();
         del_known_services();
+        /* Free Vectorscan databases before the signature lists they reference */
+        hs_sigdb_free(config.hs_serv_tcp);
+        hs_sigdb_free(config.hs_serv_udp);
+        hs_sigdb_free(config.hs_client_tcp);
+        hs_sigdb_free(config.hs_client_udp);
+        config.hs_serv_tcp = config.hs_serv_udp = NULL;
+        config.hs_client_tcp = config.hs_client_udp = NULL;
         del_signature_lists();
         unload_tcp_sigs();
         end_logging();
@@ -1354,7 +1362,9 @@ void prads_version(void)
 {
     olog("[*] prads %s\n", VERSION);
     olog("    Using %s\n", pcap_lib_version());
-    olog("    Using PCRE version %s\n", pcre_version());
+    olog("    Using Vectorscan version %s\n", hs_engine_version());
+    olog("    Using PCRE2 version %d.%d for capture extraction\n",
+         PCRE2_MAJOR, PCRE2_MINOR);
 }
 
 /* magic main */
@@ -1467,6 +1477,33 @@ int main(int argc, char *argv[])
     load_foo(load_servicefp_file, cof, CS_TCP_SERVER, sig_file_serv_tcp, sig_serv_tcp, sig_hashsize, dump_sig_service);
     load_foo(load_servicefp_file, cof, CS_UDP_SERVICES, sig_file_serv_udp, sig_serv_udp, sig_hashsize, dump_sig_service);
     load_foo(load_servicefp_file, cof, CS_TCP_CLIENT, sig_file_cli_tcp, sig_client_tcp, sig_hashsize, dump_sig_service);
+
+    /* -----------------------------------------------------------
+     * Compile Vectorscan multi-pattern databases from the loaded
+     * signature linked-lists.  Each database scans all patterns
+     * for its category in a single DFA pass.
+     * ----------------------------------------------------------- */
+    if (config.sig_serv_tcp != NULL) {
+        config.hs_serv_tcp = hs_sigdb_compile(config.sig_serv_tcp, "serv_tcp");
+        if (config.hs_serv_tcp == NULL)
+            olog("[!] WARNING: Vectorscan compilation failed for TCP server sigs\n");
+    }
+    if (config.sig_serv_udp != NULL) {
+        config.hs_serv_udp = hs_sigdb_compile(config.sig_serv_udp, "serv_udp");
+        if (config.hs_serv_udp == NULL)
+            olog("[!] WARNING: Vectorscan compilation failed for UDP server sigs\n");
+    }
+    if (config.sig_client_tcp != NULL) {
+        config.hs_client_tcp = hs_sigdb_compile(config.sig_client_tcp, "client_tcp");
+        if (config.hs_client_tcp == NULL)
+            olog("[!] WARNING: Vectorscan compilation failed for TCP client sigs\n");
+    }
+    if (config.sig_client_udp != NULL) {
+        config.hs_client_udp = hs_sigdb_compile(config.sig_client_udp, "client_udp");
+        if (config.hs_client_udp == NULL)
+            olog("[!] WARNING: Vectorscan compilation failed for UDP client sigs\n");
+    }
+
     init_services();
 
     display_config(&config);
