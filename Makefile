@@ -14,8 +14,8 @@ build:
 	@echo "You need libpcre2-dev, libpcap-dev, and libvectorscan-dev (or libhyperscan-dev) to compile this program."
 	${MAKE} CONFDIR=${CONFDIR} -C src/
 pfring:
-        @echo "You need libpcre-dev, libpcap-dev, librt, libnuma and libpfring to compile this program."
-        ${MAKE} CONFDIR=${CONFDIR} -f Makefile.pfring -C src/
+	@echo "You need libpcre2-dev, libpcap-dev, librt, libnuma, libvectorscan-dev (or libhyperscan-dev), and libpfring to compile this program."
+	${MAKE} CONFDIR=${CONFDIR} -f Makefile.pfring -C src/
 
 clean:
 	${MAKE} -C src/ $@

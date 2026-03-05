@@ -32,7 +32,7 @@ endif
 ifeq (${TCMALLOC},y)
 LDFLAGS+=-ltcmalloc
 endif
-LDFLAGS+=-lpcap -lpcre -lresolv -lpfring -lrt -lnuma
+LDFLAGS+=-lpcap -lhs -lpcre2-8 -lresolv -lpfring -lrt -lnuma -lstdc++ -lm
 CFLAGS+=-DCONFDIR='"${CONFDIR}/"'
 
 else
@@ -48,7 +48,7 @@ endif
 
 CFLAGS+=-DCONFDIR='"prads.d/"' -static
 LDFLAGS=-static
-LDFLAGS+=${LIBDIR}/libpcre.a ${PCAPDIR}/libpcap.a ${LIBDIR}/libresolv.a
+LDFLAGS+=${LIBDIR}/libhs.a ${LIBDIR}/libpcre2-8.a ${PCAPDIR}/libpcap.a ${LIBDIR}/libresolv.a -lstdc++ -lm
 
 endif
 
@@ -68,7 +68,7 @@ ifneq (${DEBUG_PACKET},)
 CFLAGS+= -DDEBUG_PACKET
 endif
 ifeq ($(UNAME), FreeBSD)
-LDFLAGS= -L/usr/local/lib -lpcre -lpcap
+LDFLAGS= -L/usr/local/lib -lhs -lpcre2-8 -lpcap -lstdc++ -lm
 CPPFLAGS= -I/usr/local/include
 endif
 
@@ -87,7 +87,7 @@ IPFP_OBJ = ipfp/ipfp.o ipfp/udp_fp.o ipfp/icmp_fp.o
 LOG_OBJ = output-plugins/log_dispatch.o output-plugins/log_stdout.o output-plugins/log_file.o output-plugins/log_fifo.o output-plugins/log_ringbuffer.o output-plugins/log_sguil.o
 CXT_OBJ = cxt.o
 MODULES = dhcp.o dump_dns.o mac.o ${SERVICE_OBJ} ${IPFP_OBJ} ${CXT_OBJ} ${LOG_OBJ}
-OBJECTS = bstrlib.o sig_tcp.o config.o sys_func.o assets.o prads.o ${MODULES}
+OBJECTS = bstrlib.o sig_tcp.o config.o sys_func.o assets.o hs_engine.o prads.o ${MODULES}
 SHM_CLIENT_OBJECTS = shm-client.o
 
 all: prads shm-client
