@@ -35,7 +35,7 @@
 #ifndef RELEASE
 #define RELEASE
 #endif
-#define VERSION                       "0.3.3"RELEASE
+#define VERSION                       "0.4.0"RELEASE
 #define SIG_ALRM                      60        /* Time between cxt and asset cleaning/printing */
 #define TCP_TIMEOUT                   300       /* When idle IP connections should be timed out */
 #define ASSET_TIMEOUT                 86400     /* Time befor an asset is deleted if no updates */

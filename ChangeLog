@@ -1,0 +1,47 @@
+ChangeLog for PRADS - Passive Real-time Asset Detection System
+
+0.4.0 - 2026-03-16
+-------------------
+
+  Engine:
+  * Replace PCRE with Vectorscan (Hyperscan) + PCRE2 for service fingerprinting.
+    All service signatures are now compiled into a single Vectorscan multi-pattern
+    DFA per category (TCP server, TCP client, UDP server, UDP client) for fast
+    matching. Signatures requiring capture groups or incompatible with Vectorscan
+    fall back to PCRE2 automatically.
+  * Add serialized Vectorscan database caching (hs_cache_save/hs_cache_load).
+    Compiled databases are written to disk and reloaded on subsequent startups,
+    avoiding recompilation when signatures and the Vectorscan version are unchanged.
+    Cache is invalidated by FNV-1a hash of signature file contents or Vectorscan
+    library version change.
+  * Filter non-printable characters from PCRE2 capture group substitution in
+    service name templates ($1/$2 replacements).
+  * Fix sig_flags initialization order in hs_sigdb_compile to ensure flags are
+    set for all slots regardless of active/inactive state.
+
+  Build:
+  * Update Makefile.pfring to link against Vectorscan (-lhs) and PCRE2 (-lpcre2-8).
+  * Guard PF_RING header includes and API calls behind HAVE_PFRING preprocessor
+    flag, allowing builds without PF_RING installed.
+  * Add CMakeLists.txt support for Vectorscan + PCRE2 dependencies.
+
+  Tools:
+  * Add nmap2prads signature converter (tools/nmap2prads/) for generating PRADS
+    passive service signatures from nmap-service-probes with Vectorscan/PCRE2
+    optimization pipeline.
+  * Add prads-asset-report2: asset report generator with text, ECS JSON, and
+    dict JSON output formats, OS inference engine combining TCP fingerprint
+    voting with service banner and User-Agent analysis.
+  * Add prads2snort2: IDS host attribute generator for Snort XML, Suricata YAML
+    (host-os-policy, defrag, libhtp personalities), and ECS JSON output.
+  * Add prads_utils.py shared library for log parsing, OS inference, policy
+    mapping, and ECS serialization.
+
+  Documentation:
+  * Add tools/README.md with full documentation, example outputs, and API
+    reference for the Python analysis tools.
+  * Add CLAUDE.md project guidance document.
+
+0.3.3 - prior
+--------------
+  * See git log for earlier history.

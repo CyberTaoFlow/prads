@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 project(prads
-    VERSION 0.3.4
+    VERSION 0.4.0
     DESCRIPTION "Passive Real-time Asset Detection System (Vectorscan edition)"
     LANGUAGES C CXX)
 
