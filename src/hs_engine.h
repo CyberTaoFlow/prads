@@ -127,4 +127,31 @@ int hs_on_match(unsigned int id, unsigned long long from,
  */
 const char *hs_engine_version(void);
 
+/* -------------------------------------------------------------------
+ * Serialized database cache — avoids recompiling on every startup.
+ *
+ * Cache file layout:
+ *   [hs_cache_header_t]          fixed-size header
+ *   [hs_count bytes]             per-slot sig_flags (incl. PCRE2_ONLY)
+ *   [hsdb_size bytes]            serialized Vectorscan database
+ *
+ * The cache is invalidated when the sig file contents change
+ * (FNV-1a hash) or the Vectorscan library version changes.
+ * ------------------------------------------------------------------- */
+
+/*
+ * Try to load a cached compiled database from disk.
+ * Returns a fully-populated hs_sigdb_t on cache hit (PCRE2 patterns
+ * compiled for sigs that need them), NULL on cache miss or error.
+ */
+hs_sigdb_t *hs_cache_load(signature *siglist, const char *cache_path,
+                           const char *sig_file_path, const char *db_label);
+
+/*
+ * Save a compiled database to disk for future fast loading.
+ * Returns 0 on success, -1 on failure (logged, non-fatal).
+ */
+int hs_cache_save(const hs_sigdb_t *hsdb, const char *cache_path,
+                  const char *sig_file_path, const char *db_label);
+
 #endif /* HS_ENGINE_H */

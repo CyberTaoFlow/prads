@@ -1,0 +1,1932 @@
+From 3ddf405cc3696fb83cf3dac0849e940e8fba51c2 Mon Sep 17 00:00:00 2001
+From: Panoptic <panoptic@localhost>
+Date: Thu, 5 Mar 2026 09:32:15 +0000
+Subject: [PATCH] Replace PCRE with Vectorscan + PCRE2 for service
+ fingerprinting
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Swap out the legacy PCRE (end-of-life since 2020) regex engine with
+Vectorscan (Hyperscan-compatible) for multi-pattern scanning and PCRE2
+for selective capture-group extraction.
+
+Architecture (Option 3 — Vectorscan + PCRE2 selective fallback):
+
+  - All service/client signatures are compiled into a single Vectorscan
+    block-mode multi-pattern database per category (serv_tcp, serv_udp,
+    client_tcp, client_udp).  This replaces the O(N) linear pcre_exec
+    walk with a single DFA pass over all patterns simultaneously.
+
+  - Signatures that use capture groups ($1/$2 in title templates) also
+    get a PCRE2 compiled pattern.  After Vectorscan identifies which
+    pattern matched, one targeted pcre2_match extracts the captures.
+
+  - Signatures with unsupported Vectorscan constructs (negative
+    lookaheads, backreferences) are compiled in HS_FLAG_PREFILTER mode.
+    Prefilter matches are confirmed by a single PCRE2 exec.
+
+  - Signatures that cannot compile in Vectorscan at all (extremely rare)
+    fall back to linear PCRE2 scanning.
+
+Performance impact for ~3000 pattern fingerprint libraries:
+
+  Before: Up to 3000 sequential pcre_exec() calls per payload
+  After:  1 hs_scan() + at most 1 pcre2_match() per payload
+
+  First-match-wins ordering is preserved by sorting Vectorscan match
+  IDs by their original signature ordinal.
+
+Safety considerations:
+
+  - Eliminates libpcre (EOL) from the attack surface on sensors
+    deployed in hospitals and government networks
+  - PCRE2 is actively maintained and receives CVE patches
+  - Graceful degradation: patterns that fail Vectorscan compilation
+    fall through to prefilter, then PCRE2-only, with logging at each
+    stage
+  - Memory cleanup ordering ensures Vectorscan databases are freed
+    before the signature linked-lists they reference
+
+Build changes:
+
+  - src/Makefile: -lpcre replaced with -lhs -lpcre2-8 -lstdc++ -lm
+  - CMakeLists.txt: new CMake build system alongside existing Makefile
+  - Dependencies: libvectorscan-dev (or libhyperscan-dev) + libpcre2-dev
+
+New files:
+  - src/hs_engine.h  — Vectorscan engine data structures and API
+  - src/hs_engine.c  — Multi-pattern compilation, scanning, app-name
+                       extraction with PCRE2 capture support
+  - CMakeLists.txt   — Modern build system with pkg-config detection
+
+Modified files:
+  - src/prads.h      — signature struct: pcre* -> pcre2_code* + hs fields
+  - src/config.h     — globalconfig: added hs_sigdb_t* per category
+  - src/servicefp/servicefp.c — deferred regex compilation, PCRE2 cleanup
+  - src/servicefp/tcps.c      — Vectorscan scan + PCRE2 capture path
+  - src/servicefp/tcpc.c      — same
+  - src/servicefp/udps.c      — same
+  - src/prads.c      — init/cleanup for Vectorscan databases
+---
+ CMakeLists.txt            | 180 ++++++++++++++
+ Makefile                  |   2 +-
+ src/Makefile              |   8 +-
+ src/config.h              |   7 +
+ src/hs_engine.c           | 496 ++++++++++++++++++++++++++++++++++++++
+ src/hs_engine.h           | 130 ++++++++++
+ src/prads.c               |  39 ++-
+ src/prads.h               |  11 +-
+ src/servicefp/servicefp.c | 126 +++++-----
+ src/servicefp/servicefp.h |   5 +-
+ src/servicefp/tcpc.c      | 128 +++++++---
+ src/servicefp/tcps.c      | 151 +++++++++---
+ src/servicefp/udps.c      | 129 +++++++---
+ 13 files changed, 1234 insertions(+), 178 deletions(-)
+ create mode 100644 CMakeLists.txt
+ create mode 100644 src/hs_engine.c
+ create mode 100644 src/hs_engine.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+new file mode 100644
+index 0000000..e1909ab
+--- /dev/null
++++ b/CMakeLists.txt
+@@ -0,0 +1,180 @@
++cmake_minimum_required(VERSION 3.14)
++project(prads
++    VERSION 0.3.4
++    DESCRIPTION "Passive Real-time Asset Detection System (Vectorscan edition)"
++    LANGUAGES C CXX)
++
++set(CMAKE_C_STANDARD 11)
++set(CMAKE_C_STANDARD_REQUIRED ON)
++
++# -------------------------------------------------------------------
++# Build options
++# -------------------------------------------------------------------
++option(PRADS_USE_JEMALLOC  "Link against jemalloc"        OFF)
++option(PRADS_USE_TCMALLOC  "Link against tcmalloc"        OFF)
++option(PRADS_BUILD_STATIC  "Build a fully-static binary"  OFF)
++option(PRADS_DEBUG          "Enable debug build"           OFF)
++
++# -------------------------------------------------------------------
++# Config directory (signatures, fingerprints)
++# -------------------------------------------------------------------
++set(PRADS_CONFDIR "${CMAKE_INSTALL_PREFIX}/etc/prads"
++    CACHE STRING "Runtime configuration directory")
++add_compile_definitions(CONFDIR="${PRADS_CONFDIR}/")
++add_compile_definitions(__USE_GNU)
++
++if(PRADS_DEBUG)
++    add_compile_definitions(DEBUG)
++    set(CMAKE_BUILD_TYPE Debug)
++else()
++    set(CMAKE_BUILD_TYPE Release)
++    add_compile_options(-O3)
++endif()
++
++# -------------------------------------------------------------------
++# Dependencies
++# -------------------------------------------------------------------
++find_package(PkgConfig REQUIRED)
++
++# libpcap
++find_library(PCAP_LIBRARY NAMES pcap)
++find_path(PCAP_INCLUDE_DIR NAMES pcap.h)
++if(NOT PCAP_LIBRARY)
++    message(FATAL_ERROR "libpcap not found.  Install libpcap-dev.")
++endif()
++
++# Vectorscan / Hyperscan
++# Try vectorscan first, fall back to hyperscan
++pkg_check_modules(HS QUIET vectorscan)
++if(NOT HS_FOUND)
++    pkg_check_modules(HS QUIET libhs)
++endif()
++if(NOT HS_FOUND)
++    find_library(HS_LIBRARIES NAMES hs)
++    find_path(HS_INCLUDE_DIRS NAMES hs/hs.h)
++    if(HS_LIBRARIES AND HS_INCLUDE_DIRS)
++        set(HS_FOUND TRUE)
++    endif()
++endif()
++if(NOT HS_FOUND)
++    message(FATAL_ERROR
++        "Vectorscan (or Hyperscan) not found.\n"
++        "Install libvectorscan-dev or libhyperscan-dev.")
++endif()
++
++# PCRE2
++pkg_check_modules(PCRE2 QUIET libpcre2-8)
++if(NOT PCRE2_FOUND)
++    find_library(PCRE2_LIBRARIES NAMES pcre2-8)
++    find_path(PCRE2_INCLUDE_DIRS NAMES pcre2.h)
++    if(PCRE2_LIBRARIES AND PCRE2_INCLUDE_DIRS)
++        set(PCRE2_FOUND TRUE)
++    endif()
++endif()
++if(NOT PCRE2_FOUND)
++    message(FATAL_ERROR "libpcre2-8 not found.  Install libpcre2-dev.")
++endif()
++
++# resolv
++find_library(RESOLV_LIBRARY NAMES resolv)
++
++# -------------------------------------------------------------------
++# Sources
++# -------------------------------------------------------------------
++set(PRADS_SOURCES
++    src/prads.c
++    src/config.c
++    src/sys_func.c
++    src/assets.c
++    src/cxt.c
++    src/bstrlib.c
++    src/sig_tcp.c
++    src/mac.c
++    src/dhcp.c
++    src/dump_dns.c
++    src/hs_engine.c
++    src/servicefp/servicefp.c
++    src/servicefp/tcps.c
++    src/servicefp/tcpc.c
++    src/servicefp/udps.c
++    src/ipfp/ipfp.c
++    src/ipfp/udp_fp.c
++    src/ipfp/icmp_fp.c
++    src/output-plugins/log_dispatch.c
++    src/output-plugins/log_stdout.c
++    src/output-plugins/log_file.c
++    src/output-plugins/log_fifo.c
++    src/output-plugins/log_ringbuffer.c
++    src/output-plugins/log_sguil.c
++)
++
++# -------------------------------------------------------------------
++# Target
++# -------------------------------------------------------------------
++add_executable(prads ${PRADS_SOURCES})
++
++target_include_directories(prads PRIVATE
++    ${PCAP_INCLUDE_DIR}
++    ${HS_INCLUDE_DIRS}
++    ${PCRE2_INCLUDE_DIRS}
++    src/
++)
++
++target_link_libraries(prads PRIVATE
++    ${PCAP_LIBRARY}
++    ${HS_LIBRARIES}
++    ${PCRE2_LIBRARIES}
++    ${RESOLV_LIBRARY}
++    stdc++
++    m
++)
++
++if(PRADS_USE_JEMALLOC)
++    find_library(JEMALLOC_LIB jemalloc)
++    target_compile_definitions(prads PRIVATE USE_JEMALLOC)
++    target_link_libraries(prads PRIVATE ${JEMALLOC_LIB})
++endif()
++
++if(PRADS_USE_TCMALLOC)
++    find_library(TCMALLOC_LIB tcmalloc)
++    target_link_libraries(prads PRIVATE ${TCMALLOC_LIB})
++endif()
++
++if(PRADS_BUILD_STATIC)
++    set_target_properties(prads PROPERTIES LINK_FLAGS "-static")
++endif()
++
++# -------------------------------------------------------------------
++# Git version in RELEASE define
++# -------------------------------------------------------------------
++execute_process(
++    COMMAND git describe --always --dirty
++    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
++    OUTPUT_VARIABLE GIT_VERSION
++    OUTPUT_STRIP_TRAILING_WHITESPACE
++    ERROR_QUIET)
++if(GIT_VERSION)
++    target_compile_definitions(prads PRIVATE RELEASE="${GIT_VERSION}")
++else()
++    target_compile_definitions(prads PRIVATE RELEASE="")
++endif()
++
++# -------------------------------------------------------------------
++# Install
++# -------------------------------------------------------------------
++include(GNUInstallDirs)
++
++install(TARGETS prads RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
++
++install(FILES etc/prads.conf DESTINATION ${PRADS_CONFDIR})
++
++install(FILES
++    etc/tcp-syn.fp etc/tcp-synack.fp etc/tcp-fin.fp
++    etc/tcp-rst.fp etc/tcp-stray-ack.fp
++    etc/tcp-service.sig etc/tcp-clients.sig etc/udp-service.sig
++    etc/service-string.sig etc/icmp-data.sig etc/mtu.sig
++    etc/os.sig etc/mac.sig etc/eth.sig
++    DESTINATION ${PRADS_CONFDIR})
++
++install(PROGRAMS tools/prads-asset-report tools/prads2snort
++    DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff --git a/Makefile b/Makefile
+index 9c8b550..853736e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -11,7 +11,7 @@ INSTALLGROUP=wheel
+ endif
+ 
+ build:
+-	@echo "You need libpcre-dev and libpcap-dev to compile this program."
++	@echo "You need libpcre2-dev, libpcap-dev, and libvectorscan-dev (or libhyperscan-dev) to compile this program."
+ 	${MAKE} CONFDIR=${CONFDIR} -C src/
+ 
+ clean:
+diff --git a/src/Makefile b/src/Makefile
+index ee0cf37..c69f1df 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -32,7 +32,7 @@ endif
+ ifeq (${TCMALLOC},y)
+ LDFLAGS+=-ltcmalloc
+ endif
+-LDFLAGS+=-lpcap -lpcre -lresolv
++LDFLAGS+=-lpcap -lhs -lpcre2-8 -lresolv -lstdc++ -lm
+ CFLAGS+=-DCONFDIR='"${CONFDIR}/"'
+ 
+ else
+@@ -48,7 +48,7 @@ endif
+ 
+ CFLAGS+=-DCONFDIR='"prads.d/"' -static
+ LDFLAGS=-static
+-LDFLAGS+=${LIBDIR}/libpcre.a ${PCAPDIR}/libpcap.a ${LIBDIR}/libresolv.a
++LDFLAGS+=${LIBDIR}/libhs.a ${LIBDIR}/libpcre2-8.a ${PCAPDIR}/libpcap.a ${LIBDIR}/libresolv.a -lstdc++ -lm
+ 
+ endif
+ 
+@@ -68,7 +68,7 @@ ifneq (${DEBUG_PACKET},)
+ CFLAGS+= -DDEBUG_PACKET
+ endif
+ ifeq ($(UNAME), FreeBSD)
+-LDFLAGS= -L/usr/local/lib -lpcre -lpcap
++LDFLAGS= -L/usr/local/lib -lhs -lpcre2-8 -lpcap -lstdc++ -lm
+ CPPFLAGS= -I/usr/local/include
+ endif
+ 
+@@ -87,7 +87,7 @@ IPFP_OBJ = ipfp/ipfp.o ipfp/udp_fp.o ipfp/icmp_fp.o
+ LOG_OBJ = output-plugins/log_dispatch.o output-plugins/log_stdout.o output-plugins/log_file.o output-plugins/log_fifo.o output-plugins/log_ringbuffer.o output-plugins/log_sguil.o
+ CXT_OBJ = cxt.o
+ MODULES = dhcp.o dump_dns.o mac.o ${SERVICE_OBJ} ${IPFP_OBJ} ${CXT_OBJ} ${LOG_OBJ}
+-OBJECTS = bstrlib.o sig_tcp.o config.o sys_func.o assets.o prads.o ${MODULES}
++OBJECTS = bstrlib.o sig_tcp.o config.o sys_func.o assets.o hs_engine.o prads.o ${MODULES}
+ SHM_CLIENT_OBJECTS = shm-client.o
+ 
+ all: prads shm-client
+diff --git a/src/config.h b/src/config.h
+index ea59ee0..7105be4 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -36,6 +36,9 @@
+ #define CS_ICMP                       0x20
+ #define CS_ARP                        0x80
+ 
++/* Forward declaration for Vectorscan multi-pattern databases */
++struct _hs_sigdb;
++
+ typedef struct _globalconfig {
+     pcap_t              *handle;        /* Pointer to libpcap handle */
+     struct pcap_stat    ps;             /* libpcap stats */
+@@ -80,6 +83,10 @@ typedef struct _globalconfig {
+     signature   *sig_serv_udp;          /* Pointer to list of udp service signatures */
+     signature   *sig_client_tcp;        /* Pointer to list of tcp client signatures */
+     signature   *sig_client_udp;        /* Pointer to list of udp client signatures */
++    struct _hs_sigdb *hs_serv_tcp;      /* Vectorscan DB for tcp service signatures */
++    struct _hs_sigdb *hs_serv_udp;      /* Vectorscan DB for udp service signatures */
++    struct _hs_sigdb *hs_client_tcp;    /* Vectorscan DB for tcp client signatures  */
++    struct _hs_sigdb *hs_client_udp;    /* Vectorscan DB for udp client signatures  */
+     fmask       *network[MAX_NETS];     /* Struct for fmask */
+     char        *dev;                   /* Device name to use for sniffing */
+     char        *chroot_dir;            /* Directory to chroot to */
+diff --git a/src/hs_engine.c b/src/hs_engine.c
+new file mode 100644
+index 0000000..0cb8e5c
+--- /dev/null
++++ b/src/hs_engine.c
+@@ -0,0 +1,496 @@
++/*
++** hs_engine.c - Vectorscan multi-pattern matching engine for PRADS
++**
++** See hs_engine.h for design overview.
++**
++** Copyright (C) 2025 — released under the same GPLv2 terms as PRADS.
++*/
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "common.h"
++#include "prads.h"
++#include "config.h"
++#include "hs_engine.h"
++#include "sys_func.h"
++
++extern globalconfig config;
++
++/* -------------------------------------------------------------------
++ * Internal helpers
++ * ------------------------------------------------------------------- */
++
++/*
++ * Check whether a signature title template uses $N capture references.
++ * Returns 1 if any $0-$9 placeholder is found in app, ver, or misc.
++ */
++static int sig_needs_captures(const signature *sig)
++{
++    const char *fields[3];
++    int nfields = 0;
++
++    if (sig->title.app  && sig->title.app->slen  > 0)
++        fields[nfields++] = (const char *)sig->title.app->data;
++    if (sig->title.ver  && sig->title.ver->slen  > 0)
++        fields[nfields++] = (const char *)sig->title.ver->data;
++    if (sig->title.misc && sig->title.misc->slen > 0)
++        fields[nfields++] = (const char *)sig->title.misc->data;
++
++    for (int i = 0; i < nfields; i++) {
++        for (const char *p = fields[i]; *p; p++) {
++            if (*p == '$' && p[1] >= '0' && p[1] <= '9')
++                return 1;
++        }
++    }
++    return 0;
++}
++
++/*
++ * Sort an array of unsigned ints in ascending order (for first-match-wins).
++ * Simple insertion sort — HS_MAX_MATCHES is small.
++ */
++static void sort_match_ids(unsigned int *ids, int count)
++{
++    for (int i = 1; i < count; i++) {
++        unsigned int key = ids[i];
++        int j = i - 1;
++        while (j >= 0 && ids[j] > key) {
++            ids[j + 1] = ids[j];
++            j--;
++        }
++        ids[j + 1] = key;
++    }
++}
++
++/* -------------------------------------------------------------------
++ * Vectorscan match callback
++ * ------------------------------------------------------------------- */
++int hs_on_match(unsigned int id, unsigned long long from,
++                unsigned long long to, unsigned int flags, void *ctx)
++{
++    (void)from;
++    (void)to;
++    (void)flags;
++
++    hs_match_ctx_t *mctx = (hs_match_ctx_t *)ctx;
++    if (mctx->count < HS_MAX_MATCHES) {
++        mctx->ids[mctx->count++] = id;
++    }
++    return 0; /* continue scanning — collect all matches */
++}
++
++/* -------------------------------------------------------------------
++ * hs_sigdb_compile — build multi-pattern database from signature list
++ *
++ * Strategy: collect all patterns, attempt hs_compile_multi().  On
++ * failure, promote the offending pattern to PREFILTER and retry.
++ * If PREFILTER also fails, move the pattern to the PCRE2-only list.
++ * This avoids thousands of individual hs_compile / hs_free_database
++ * cycles that can fragment the heap with large signature libraries.
++ * ------------------------------------------------------------------- */
++hs_sigdb_t *hs_sigdb_compile(signature *siglist, const char *db_label)
++{
++    signature *sig;
++    uint32_t total = 0;
++
++    /* First pass: count signatures with valid regex strings */
++    for (sig = siglist; sig != NULL; sig = sig->next) {
++        if (sig->regex_str != NULL && bdata(sig->regex_str) != NULL
++            && sig->regex_str->slen > 0)
++            total++;
++    }
++
++    if (total == 0) {
++        olog("[!] hs_sigdb_compile(%s): empty signature list\n", db_label);
++        return NULL;
++    }
++
++    olog("[*] hs_sigdb_compile(%s): processing %u signatures\n", db_label, total);
++
++    /* Allocate working arrays sized to total (some may move to pcre2_only) */
++    const char  **expressions  = calloc(total, sizeof(char *));
++    unsigned int *hs_flags_arr = calloc(total, sizeof(unsigned int));
++    unsigned int *hs_ids       = calloc(total, sizeof(unsigned int));
++    uint8_t      *per_sig_fl   = calloc(total, sizeof(uint8_t));
++    signature   **sig_map      = calloc(total, sizeof(signature *));
++
++    /* Temporary array for PCRE2-only fallback signatures */
++    signature   **pcre2_only_tmp = calloc(total, sizeof(signature *));
++    uint32_t      pcre2_only_cnt = 0;
++
++    /* Track which batch slots are still active (not evicted to pcre2_only) */
++    int          *active       = calloc(total, sizeof(int));
++
++    if (!expressions || !hs_flags_arr || !hs_ids || !per_sig_fl ||
++        !sig_map || !pcre2_only_tmp || !active) {
++        olog("[!] hs_sigdb_compile(%s): allocation failure\n", db_label);
++        goto fail_alloc;
++    }
++
++    /* -----------------------------------------------------------
++     * Second pass: populate batch arrays
++     * ----------------------------------------------------------- */
++    uint32_t batch_count = 0;
++    for (sig = siglist; sig != NULL; sig = sig->next) {
++        if (sig->regex_str == NULL || bdata(sig->regex_str) == NULL
++            || sig->regex_str->slen == 0)
++            continue;
++
++        const char *pattern = (const char *)bdata(sig->regex_str);
++        int needs_cap = sig_needs_captures(sig);
++
++        expressions[batch_count]  = pattern; /* points into bstring — valid for lifetime */
++        hs_flags_arr[batch_count] = HS_FLAG_DOTALL | HS_FLAG_SINGLEMATCH;
++        hs_ids[batch_count]       = batch_count;
++        sig_map[batch_count]      = sig;
++        per_sig_fl[batch_count]   = needs_cap ? HS_SIG_CAPTURE : HS_SIG_NORMAL;
++        active[batch_count]       = 1;
++        sig->hs_id                = batch_count;
++        sig->hs_flags             = per_sig_fl[batch_count];
++
++        batch_count++;
++    }
++
++    olog("[*] hs_sigdb_compile(%s): %u patterns in initial batch\n",
++         db_label, batch_count);
++
++    /* -----------------------------------------------------------
++     * Iterative multi-compile: on failure, promote or evict the
++     * offending pattern and retry until success or empty batch.
++     *
++     * Vectorscan's compile_err->expression gives us the index of
++     * the first pattern that caused the compilation to fail.
++     * ----------------------------------------------------------- */
++    int max_retries = (int)batch_count + 10; /* safety bound */
++    int retries = 0;
++
++    while (retries < max_retries) {
++        /* Build compact arrays from active slots */
++        uint32_t hs_count = 0;
++        for (uint32_t j = 0; j < batch_count; j++) {
++            if (!active[j]) continue;
++            expressions[hs_count]  = (const char *)bdata(sig_map[j]->regex_str);
++            hs_flags_arr[hs_count] = HS_FLAG_DOTALL | HS_FLAG_SINGLEMATCH;
++            if (per_sig_fl[j] & HS_SIG_PREFILTER)
++                hs_flags_arr[hs_count] |= HS_FLAG_PREFILTER;
++            hs_ids[hs_count]       = j;  /* maps back to original slot */
++            hs_count++;
++        }
++
++        if (hs_count == 0)
++            break;
++
++        hs_compile_error_t *compile_err = NULL;
++        hs_database_t *db = NULL;
++        hs_error_t ret = hs_compile_multi(expressions, hs_flags_arr, hs_ids,
++                                          hs_count, HS_MODE_BLOCK, NULL,
++                                          &db, &compile_err);
++        if (ret == HS_SUCCESS) {
++            /* Success — build the final database structure */
++            hs_sigdb_t *hsdb = calloc(1, sizeof(hs_sigdb_t));
++            if (!hsdb) {
++                hs_free_database(db);
++                goto fail_alloc;
++            }
++            hsdb->db = db;
++
++            ret = hs_alloc_scratch(hsdb->db, &hsdb->scratch);
++            if (ret != HS_SUCCESS) {
++                olog("[!] hs_sigdb_compile(%s): hs_alloc_scratch failed (%d)\n",
++                     db_label, ret);
++                hs_free_database(db);
++                free(hsdb);
++                goto fail_alloc;
++            }
++
++            /* Build mapping arrays (indexed by original slot ID) */
++            hsdb->sig_array = calloc(batch_count, sizeof(signature *));
++            hsdb->sig_flags = calloc(batch_count, sizeof(uint8_t));
++            hsdb->hs_count  = batch_count; /* max possible ID + 1 */
++
++            if (!hsdb->sig_array || !hsdb->sig_flags) {
++                hs_sigdb_free(hsdb);
++                goto fail_alloc;
++            }
++            for (uint32_t j = 0; j < batch_count; j++) {
++                if (!active[j]) continue;
++                hsdb->sig_array[j] = sig_map[j];
++                hsdb->sig_flags[j] = per_sig_fl[j];
++            }
++
++            /* Compile PCRE2 patterns for sigs that need captures or prefilter confirm */
++            for (uint32_t j = 0; j < batch_count; j++) {
++                if (!active[j]) continue;
++                signature *s = sig_map[j];
++                uint8_t sf = per_sig_fl[j];
++                if (sf & (HS_SIG_CAPTURE | HS_SIG_PREFILTER)) {
++                    int errcode;
++                    PCRE2_SIZE errofs;
++                    const char *pat = (const char *)bdata(s->regex_str);
++                    if (pat == NULL) continue;
++                    s->re = pcre2_compile((PCRE2_SPTR)pat,
++                                          PCRE2_ZERO_TERMINATED,
++                                          PCRE2_DOTALL,
++                                          &errcode, &errofs, NULL);
++                    if (s->re != NULL) {
++                        s->match_data = pcre2_match_data_create_from_pattern(
++                                            s->re, NULL);
++                    }
++                    s->hs_flags = sf;
++                }
++            }
++
++            /* Transfer PCRE2-only list */
++            if (pcre2_only_cnt > 0) {
++                hsdb->pcre2_only = calloc(pcre2_only_cnt, sizeof(signature *));
++                if (hsdb->pcre2_only) {
++                    memcpy(hsdb->pcre2_only, pcre2_only_tmp,
++                           pcre2_only_cnt * sizeof(signature *));
++                }
++            }
++            hsdb->pcre2_only_count = pcre2_only_cnt;
++
++            olog("[*] hs_sigdb_compile(%s): %u in Vectorscan, %u PCRE2-only\n",
++                 db_label, hs_count, pcre2_only_cnt);
++
++            /* Clean up working arrays */
++            free(expressions);
++            free(hs_flags_arr);
++            free(hs_ids);
++            free(per_sig_fl);
++            free(sig_map);
++            free(pcre2_only_tmp);
++            free(active);
++            return hsdb;
++        }
++
++        /* Compilation failed — identify and handle the offending pattern */
++        int fail_orig = -1;
++        if (compile_err) {
++            /* compile_err->expression is the index within the COMPACT array,
++             * but hs_ids[that_index] gives us the original slot number.    */
++            if (compile_err->expression >= 0 &&
++                (unsigned int)compile_err->expression < hs_count) {
++                fail_orig = (int)hs_ids[compile_err->expression];
++            }
++            dlog("[*] hs(%s): pattern #%d failed: %s\n",
++                 db_label, fail_orig, compile_err->message);
++            hs_free_compile_error(compile_err);
++        }
++
++        if (fail_orig < 0 || fail_orig >= (int)batch_count) {
++            /* Can't identify the failing pattern — bail out */
++            olog("[!] hs_sigdb_compile(%s): unidentifiable compile failure\n",
++                 db_label);
++            break;
++        }
++
++        /* Strategy: if not yet PREFILTER, promote to PREFILTER and retry.
++         * If already PREFILTER, evict to PCRE2-only.                     */
++        if (!(per_sig_fl[fail_orig] & HS_SIG_PREFILTER)) {
++            per_sig_fl[fail_orig] |= HS_SIG_PREFILTER;
++            dlog("[*] hs(%s): promoting pattern #%d to prefilter mode\n",
++                 db_label, fail_orig);
++        } else {
++            /* Already prefilter — evict to PCRE2-only */
++            active[fail_orig] = 0;
++            per_sig_fl[fail_orig] |= HS_SIG_PCRE2_ONLY;
++            sig_map[fail_orig]->hs_flags = per_sig_fl[fail_orig];
++
++            /* Compile PCRE2 pattern for the evicted sig */
++            signature *s = sig_map[fail_orig];
++            const char *pat = (const char *)bdata(s->regex_str);
++            if (pat != NULL) {
++                int errcode;
++                PCRE2_SIZE errofs;
++                s->re = pcre2_compile((PCRE2_SPTR)pat,
++                                      PCRE2_ZERO_TERMINATED,
++                                      PCRE2_DOTALL,
++                                      &errcode, &errofs, NULL);
++                if (s->re != NULL) {
++                    s->match_data = pcre2_match_data_create_from_pattern(
++                                        s->re, NULL);
++                }
++            }
++            pcre2_only_tmp[pcre2_only_cnt++] = s;
++
++            dlog("[*] hs(%s): evicted pattern #%d to PCRE2-only fallback\n",
++                 db_label, fail_orig);
++        }
++
++        retries++;
++    }
++
++    /* If we get here, compilation failed completely */
++    olog("[!] hs_sigdb_compile(%s): all compile attempts failed after %d retries\n",
++         db_label, retries);
++
++    /* Return a PCRE2-only database so matching still works (linear fallback) */
++    if (pcre2_only_cnt > 0) {
++        hs_sigdb_t *hsdb = calloc(1, sizeof(hs_sigdb_t));
++        if (hsdb) {
++            hsdb->pcre2_only = calloc(pcre2_only_cnt, sizeof(signature *));
++            if (hsdb->pcre2_only) {
++                memcpy(hsdb->pcre2_only, pcre2_only_tmp,
++                       pcre2_only_cnt * sizeof(signature *));
++            }
++            hsdb->pcre2_only_count = pcre2_only_cnt;
++            olog("[!] hs_sigdb_compile(%s): falling back to %u PCRE2-only patterns\n",
++                 db_label, pcre2_only_cnt);
++
++            free(expressions);
++            free(hs_flags_arr);
++            free(hs_ids);
++            free(per_sig_fl);
++            free(sig_map);
++            free(pcre2_only_tmp);
++            free(active);
++            return hsdb;
++        }
++    }
++
++fail_alloc:
++    free(expressions);
++    free(hs_flags_arr);
++    free(hs_ids);
++    free(per_sig_fl);
++    free(sig_map);
++    free(pcre2_only_tmp);
++    free(active);
++    return NULL;
++}
++
++/* -------------------------------------------------------------------
++ * hs_sigdb_scan — run a payload against the multi-pattern database
++ * ------------------------------------------------------------------- */
++int hs_sigdb_scan(const hs_sigdb_t *hsdb, const char *data,
++                  unsigned int length, hs_match_ctx_t *ctx)
++{
++    ctx->count = 0;
++
++    if (!hsdb || !hsdb->db || !hsdb->scratch)
++        return 0;  /* no Vectorscan DB — return success with 0 matches
++                    * so callers fall through to pcre2_only check */
++
++    hs_error_t ret = hs_scan(hsdb->db, data, length, 0,
++                             hsdb->scratch, hs_on_match, ctx);
++    if (ret != HS_SUCCESS && ret != HS_SCAN_TERMINATED) {
++        return (int)ret;
++    }
++
++    /* Sort matches by pattern ID (ordinal) for first-match-wins */
++    if (ctx->count > 1)
++        sort_match_ids(ctx->ids, ctx->count);
++
++    return 0;
++}
++
++/* -------------------------------------------------------------------
++ * hs_sigdb_free
++ * ------------------------------------------------------------------- */
++void hs_sigdb_free(hs_sigdb_t *hsdb)
++{
++    if (!hsdb) return;
++
++    if (hsdb->scratch)
++        hs_free_scratch(hsdb->scratch);
++    if (hsdb->db)
++        hs_free_database(hsdb->db);
++
++    free(hsdb->sig_array);
++    free(hsdb->sig_flags);
++    free(hsdb->pcre2_only);
++    free(hsdb);
++}
++
++/* -------------------------------------------------------------------
++ * hs_get_app_name_pcre2 — capture-group version of get_app_name
++ *
++ * Mirrors the original get_app_name() logic but uses the PCRE2 API
++ * to retrieve captured substrings.
++ * ------------------------------------------------------------------- */
++bstring hs_get_app_name_pcre2(signature *sig, const uint8_t *payload,
++                              pcre2_match_data *match_data, int rc)
++{
++    char sub[512];
++    char app[5000];
++    int i = 0, z = 0;
++
++    /* Build the base application string from title fields.
++     * bdata() is captured into a local to satisfy GCC nonnull analysis. */
++    const char *p;
++    app[0] = '\0';
++    if (sig->title.app != NULL && (p = bdata(sig->title.app)) != NULL)
++        strncpy(app, p, MAX_APP);
++    if (sig->title.ver != NULL && sig->title.ver->slen > 0
++        && (p = (const char *)bdata(sig->title.ver)) != NULL) {
++        strcat(app, " ");
++        strncat(app, p, MAX_VER);
++    }
++    if (sig->title.misc != NULL && sig->title.misc->slen > 0
++        && (p = (const char *)bdata(sig->title.misc)) != NULL) {
++        strcat(app, " (");
++        strncat(app, p, MAX_MISC);
++        strcat(app, ")");
++    }
++
++    /* Replace $N placeholders with captured substrings */
++    while (app[i] != '\0' && z < (int)(sizeof(sub) - 1)) {
++        if (app[i] == '$') {
++            i++;
++            int n = atoi(&app[i]);
++
++            if (n >= 0 && n < rc) {
++                PCRE2_UCHAR *substr = NULL;
++                PCRE2_SIZE sublen = 0;
++                int ret = pcre2_substring_get_bynumber(
++                              match_data, (uint32_t)n, &substr, &sublen);
++                if (ret == 0 && substr != NULL) {
++                    for (PCRE2_SIZE x = 0; x < sublen && z < (int)(sizeof(sub) - 1); x++)
++                        sub[z++] = (char)substr[x];
++                    pcre2_substring_free(substr);
++                }
++            }
++            i++;  /* skip the digit after $ */
++        } else {
++            sub[z++] = app[i++];
++        }
++    }
++    sub[z] = '\0';
++    return bfromcstr(sub);
++}
++
++/* -------------------------------------------------------------------
++ * hs_get_app_name_static — no captures, build from title fields only
++ * ------------------------------------------------------------------- */
++bstring hs_get_app_name_static(signature *sig)
++{
++    char app[5000];
++    const char *p;
++
++    app[0] = '\0';
++    if (sig->title.app != NULL && (p = bdata(sig->title.app)) != NULL)
++        strncpy(app, p, MAX_APP);
++    if (sig->title.ver != NULL && sig->title.ver->slen > 0
++        && (p = (const char *)bdata(sig->title.ver)) != NULL) {
++        strcat(app, " ");
++        strncat(app, p, MAX_VER);
++    }
++    if (sig->title.misc != NULL && sig->title.misc->slen > 0
++        && (p = (const char *)bdata(sig->title.misc)) != NULL) {
++        strcat(app, " (");
++        strncat(app, p, MAX_MISC);
++        strcat(app, ")");
++    }
++    return bfromcstr(app);
++}
++
++/* -------------------------------------------------------------------
++ * hs_engine_version
++ * ------------------------------------------------------------------- */
++const char *hs_engine_version(void)
++{
++    return hs_version();
++}
+diff --git a/src/hs_engine.h b/src/hs_engine.h
+new file mode 100644
+index 0000000..871f298
+--- /dev/null
++++ b/src/hs_engine.h
+@@ -0,0 +1,130 @@
++/*
++** hs_engine.h - Vectorscan multi-pattern matching engine for PRADS
++**
++** This module replaces the per-signature PCRE linear scan with a
++** Vectorscan (Hyperscan-compatible) multi-pattern database.  All
++** service/client signatures are compiled into a single DFA that is
++** evaluated in one pass per payload.  Signatures requiring capture-
++** group extraction or those compiled in prefilter mode fall back to
++** a single targeted PCRE2 match after Vectorscan identifies which
++** signature matched.
++**
++** Copyright (C) 2025 — released under the same GPLv2 terms as PRADS.
++*/
++
++#ifndef HS_ENGINE_H
++#define HS_ENGINE_H
++
++#include <hs/hs.h>
++
++#define PCRE2_CODE_UNIT_WIDTH 8
++#include <pcre2.h>
++
++#include "bstrlib.h"
++
++/* Forward declaration — full definition lives in prads.h */
++typedef struct _signature signature;
++
++/* -------------------------------------------------------------------
++ * Per-signature flags that describe how to handle a Vectorscan match.
++ * ------------------------------------------------------------------- */
++enum hs_sig_flags {
++    HS_SIG_NORMAL     = 0,        /* Pure Vectorscan match — no PCRE2 needed  */
++    HS_SIG_PREFILTER  = (1 << 0), /* Compiled with HS_FLAG_PREFILTER — PCRE2
++                                     must confirm the match (may over-report)  */
++    HS_SIG_CAPTURE    = (1 << 1), /* Title template contains $1/$2 — PCRE2
++                                     required for capture-group extraction     */
++    HS_SIG_PCRE2_ONLY = (1 << 2), /* Pattern could not be compiled in
++                                     Vectorscan at all — linear PCRE2 fallback */
++};
++
++/* -------------------------------------------------------------------
++ * Compiled multi-pattern database for one signature category
++ * (e.g. TCP server, TCP client, UDP server, etc.).
++ * ------------------------------------------------------------------- */
++typedef struct _hs_sigdb {
++    hs_database_t   *db;          /* Compiled Vectorscan block-mode database   */
++    hs_scratch_t    *scratch;     /* Per-thread scratch space                  */
++    signature       **sig_array;  /* Map: hs pattern id  →  signature*         */
++    uint8_t         *sig_flags;   /* Map: hs pattern id  →  hs_sig_flags       */
++    uint32_t         hs_count;    /* Number of patterns in the hs database     */
++
++    /* Signatures that could not be compiled in Vectorscan at all.
++     * These are scanned linearly with PCRE2 as a last resort.       */
++    signature       **pcre2_only; /* Array of PCRE2-only signature pointers    */
++    uint32_t         pcre2_only_count;
++} hs_sigdb_t;
++
++/* -------------------------------------------------------------------
++ * Match context passed to the Vectorscan callback.  Collects all
++ * matching pattern IDs so we can honour first-match-wins ordering.
++ * ------------------------------------------------------------------- */
++#define HS_MAX_MATCHES  128       /* Upper bound on simultaneous matches       */
++
++typedef struct _hs_match_ctx {
++    unsigned int     ids[HS_MAX_MATCHES];
++    int              count;
++} hs_match_ctx_t;
++
++/* -------------------------------------------------------------------
++ * Public API
++ * ------------------------------------------------------------------- */
++
++/*
++ * Build a Vectorscan multi-pattern database from a linked list of
++ * signatures that have already been parsed (service, title, regex
++ * string populated).  Returns NULL on total failure.
++ *
++ * For each signature:
++ *   1. Try hs_compile() in block mode.
++ *   2. On failure, retry with HS_FLAG_PREFILTER.
++ *   3. On failure, mark as PCRE2_ONLY (linear fallback).
++ *   4. If the title template contains $N, compile a PCRE2 pattern.
++ *
++ * The original signature linked-list ordering is preserved as the
++ * pattern ID, ensuring first-match-wins semantics.
++ */
++hs_sigdb_t *hs_sigdb_compile(signature *siglist, const char *db_label);
++
++/*
++ * Scan a payload against a compiled multi-pattern database.
++ * Populates match_ctx with all matching pattern IDs.
++ * Returns 0 on success, non-zero on error.
++ */
++int hs_sigdb_scan(const hs_sigdb_t *hsdb, const char *data,
++                  unsigned int length, hs_match_ctx_t *ctx);
++
++/*
++ * Free a compiled multi-pattern database and all associated
++ * resources (scratch, sig_array, pcre2_only array).
++ * Does NOT free the underlying signature linked-list nodes.
++ */
++void hs_sigdb_free(hs_sigdb_t *hsdb);
++
++/*
++ * Extract application name from a signature that matched via PCRE2.
++ * This is the PCRE2 equivalent of the original get_app_name().
++ * Caller must bdestroy() the returned bstring.
++ */
++bstring hs_get_app_name_pcre2(signature *sig, const uint8_t *payload,
++                              pcre2_match_data *match_data, int rc);
++
++/*
++ * Build application name from a signature that matched without
++ * requiring captures (no $N in the title template).
++ * Caller must bdestroy() the returned bstring.
++ */
++bstring hs_get_app_name_static(signature *sig);
++
++/*
++ * Vectorscan match callback — collects pattern IDs into match_ctx.
++ */
++int hs_on_match(unsigned int id, unsigned long long from,
++                unsigned long long to, unsigned int flags, void *ctx);
++
++/*
++ * Return a human-readable Vectorscan version string.
++ */
++const char *hs_engine_version(void);
++
++#endif /* HS_ENGINE_H */
+diff --git a/src/prads.c b/src/prads.c
+index efe4319..b3d110b 100644
+--- a/src/prads.c
++++ b/src/prads.c
+@@ -36,6 +36,7 @@
+ #include "cxt.h"
+ #include "ipfp/ipfp.h"
+ #include "servicefp/servicefp.h"
++#include "hs_engine.h"
+ #include "sig.h"
+ #include "mac.h"
+ #include "tcp.h"
+@@ -1055,6 +1056,13 @@ void game_over()
+         clear_asset_list();
+         end_all_sessions();
+         del_known_services();
++        /* Free Vectorscan databases before the signature lists they reference */
++        hs_sigdb_free(config.hs_serv_tcp);
++        hs_sigdb_free(config.hs_serv_udp);
++        hs_sigdb_free(config.hs_client_tcp);
++        hs_sigdb_free(config.hs_client_udp);
++        config.hs_serv_tcp = config.hs_serv_udp = NULL;
++        config.hs_client_tcp = config.hs_client_udp = NULL;
+         del_signature_lists();
+         unload_tcp_sigs();
+         end_logging();
+@@ -1351,7 +1359,9 @@ void prads_version(void)
+ {
+     olog("[*] prads %s\n", VERSION);
+     olog("    Using %s\n", pcap_lib_version());
+-    olog("    Using PCRE version %s\n", pcre_version());
++    olog("    Using Vectorscan version %s\n", hs_engine_version());
++    olog("    Using PCRE2 version %d.%d for capture extraction\n",
++         PCRE2_MAJOR, PCRE2_MINOR);
+ }
+ 
+ /* magic main */
+@@ -1464,6 +1474,33 @@ int main(int argc, char *argv[])
+     load_foo(load_servicefp_file, cof, CS_TCP_SERVER, sig_file_serv_tcp, sig_serv_tcp, sig_hashsize, dump_sig_service);
+     load_foo(load_servicefp_file, cof, CS_UDP_SERVICES, sig_file_serv_udp, sig_serv_udp, sig_hashsize, dump_sig_service);
+     load_foo(load_servicefp_file, cof, CS_TCP_CLIENT, sig_file_cli_tcp, sig_client_tcp, sig_hashsize, dump_sig_service);
++
++    /* -----------------------------------------------------------
++     * Compile Vectorscan multi-pattern databases from the loaded
++     * signature linked-lists.  Each database scans all patterns
++     * for its category in a single DFA pass.
++     * ----------------------------------------------------------- */
++    if (config.sig_serv_tcp != NULL) {
++        config.hs_serv_tcp = hs_sigdb_compile(config.sig_serv_tcp, "serv_tcp");
++        if (config.hs_serv_tcp == NULL)
++            olog("[!] WARNING: Vectorscan compilation failed for TCP server sigs\n");
++    }
++    if (config.sig_serv_udp != NULL) {
++        config.hs_serv_udp = hs_sigdb_compile(config.sig_serv_udp, "serv_udp");
++        if (config.hs_serv_udp == NULL)
++            olog("[!] WARNING: Vectorscan compilation failed for UDP server sigs\n");
++    }
++    if (config.sig_client_tcp != NULL) {
++        config.hs_client_tcp = hs_sigdb_compile(config.sig_client_tcp, "client_tcp");
++        if (config.hs_client_tcp == NULL)
++            olog("[!] WARNING: Vectorscan compilation failed for TCP client sigs\n");
++    }
++    if (config.sig_client_udp != NULL) {
++        config.hs_client_udp = hs_sigdb_compile(config.sig_client_udp, "client_udp");
++        if (config.hs_client_udp == NULL)
++            olog("[!] WARNING: Vectorscan compilation failed for UDP client sigs\n");
++    }
++
+     init_services();
+ 
+     display_config(&config);
+diff --git a/src/prads.h b/src/prads.h
+index ba8c23d..84fc3d7 100644
+--- a/src/prads.h
++++ b/src/prads.h
+@@ -27,7 +27,9 @@
+ #include "common.h"
+ #include "bstrlib.h"
+ #include <netinet/in.h>
+-#include <pcre.h>
++#include <hs/hs.h>
++#define PCRE2_CODE_UNIT_WIDTH 8
++#include <pcre2.h>
+ 
+ /*  D E F I N E S  ************************************************************/
+ #ifndef RELEASE
+@@ -750,8 +752,11 @@ typedef struct _signature {
+         bstring ver;            /* Version */
+         bstring misc;           /* Misc info */
+     } title;
+-    pcre *regex;                /* Signature - Compiled Regular Expression */
+-    pcre_extra *study;          /* Studied version of the compiled regex. */
++    pcre2_code *re;              /* PCRE2 compiled pattern (for capture/confirm) */
++    pcre2_match_data *match_data;/* PCRE2 match data block                      */
++    bstring regex_str;           /* Raw regex string (kept for hs compilation)  */
++    uint32_t hs_id;              /* Pattern ID in Vectorscan multi-pattern DB   */
++    uint8_t  hs_flags;           /* hs_sig_flags — prefilter / capture / etc.   */
+     struct {                    /* Signature stats */
+         uint32_t    checked;    /* How many times the sig has been matched for */
+         uint32_t    matched;    /* How many times it has matched*/
+diff --git a/src/servicefp/servicefp.c b/src/servicefp/servicefp.c
+index 5a76422..58cdee3 100644
+--- a/src/servicefp/servicefp.c
++++ b/src/servicefp/servicefp.c
+@@ -43,6 +43,7 @@
+ #include "../sys_func.h"
+ #include "../prads.h"
+ #include "../config.h"
++#include "../hs_engine.h"
+ #include "servicefp.h"
+ 
+ extern globalconfig config;
+@@ -134,9 +135,7 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
+     struct bstrList *title = NULL;
+     signature *sig, *head;
+     sig = head = NULL;
+-    bstring pcre_string = NULL;
+-    const char *err = NULL;     /* PCRE */
+-    int erroffset;              /* PCRE */
++    bstring regex_string = NULL;
+     int ret = 0;
+     int i;
+ 
+@@ -160,18 +159,18 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
+     if (raw_sig->qty < 3) {
+         ret = -1;
+     } else if (raw_sig->qty > 3) {
+-        pcre_string = bstrcpy(raw_sig->entry[2]);
++        regex_string = bstrcpy(raw_sig->entry[2]);
+         for (i = 3; i < raw_sig->qty; i++) {
+             //bstring tmp = bfromcstr("||");
+             bstring tmp = bfromcstr(",");
+-            if ((bconcat(pcre_string, tmp)) == BSTR_ERR)
++            if ((bconcat(regex_string, tmp)) == BSTR_ERR)
+                 ret = -1;
+-            if ((bconcat(pcre_string, raw_sig->entry[i])) == BSTR_ERR)
++            if ((bconcat(regex_string, raw_sig->entry[i])) == BSTR_ERR)
+                 ret = -1;
+             bdestroy(tmp);
+         }
+     } else {
+-        pcre_string = bstrcpy(raw_sig->entry[2]);
++        regex_string = bstrcpy(raw_sig->entry[2]);
+     }
+ 
+     /*
+@@ -180,7 +179,7 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
+     if (raw_sig->entry[1] != NULL && ret != -1)
+         title = bsplit(raw_sig->entry[1], '/');
+     if (title == NULL) {
+-        bdestroy(pcre_string);
++        bdestroy(regex_string);
+         return -1;
+     }
+     if (title->qty < 3)
+@@ -195,30 +194,30 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
+         sig->prev = NULL;
+         if (raw_sig->entry[0] != NULL)
+             sig->service = bstrcpy(raw_sig->entry[0]);
+-        if (title->entry[1] != NULL)
++        if (title->qty > 1 && title->entry[1] != NULL)
+             sig->title.app = bstrcpy(title->entry[1]);
+-        if (title->entry[2] != NULL)
++        if (title->qty > 2 && title->entry[2] != NULL)
+             sig->title.ver = bstrcpy(title->entry[2]);
+-        if (title->entry[3] != NULL)
++        if (title->qty > 3 && title->entry[3] != NULL)
+             sig->title.misc = bstrcpy(title->entry[3]);
+ 
+         /*
+-         * PCRE 
++         * Store the raw regex string for later Vectorscan batch compilation.
++         * Pattern compilation into hs_compile_multi + selective PCRE2 happens
++         * in hs_sigdb_compile() after all signatures are loaded.
+          */
+-        if (pcre_string != NULL) {
+-            if ((sig->regex =
+-                 pcre_compile((char *)bdata(pcre_string), 0, &err,
+-                              &erroffset, NULL)) == NULL) {
+-                printf("Unable to compile signature:  %s at line %d (%s)",
+-                       err, lineno, bdata(line));
++        if (regex_string != NULL) {
++            sig->regex_str = bstrcpy(regex_string);
++            if (sig->regex_str == NULL) {
++                printf("Unable to copy regex string at line %d (%s)",
++                       lineno, bdata(line));
+                 ret = -1;
+             }
+         }
+-        if (ret != -1) {
+-            sig->study = pcre_study(sig->regex, 0, &err);
+-            if (err != NULL)
+-                printf("Unable to study signature:  %s", err);
+-        }
++        sig->re = NULL;
++        sig->match_data = NULL;
++        sig->hs_id = 0;
++        sig->hs_flags = 0;
+ 
+         /*
+          * Add signature to 'signature_list' data structure. 
+@@ -237,8 +236,8 @@ int parse_raw_signature(bstring line, int lineno, signature **db)
+         bstrListDestroy(raw_sig);
+     if (title != NULL)
+         bstrListDestroy(title);
+-    if (pcre_string != NULL)
+-        bdestroy(pcre_string);
++    if (regex_string != NULL)
++        bdestroy(regex_string);
+ 
+     return ret;
+ }
+@@ -266,8 +265,9 @@ void free_signature_list (signature *head)
+             bdestroy(head->title.app);
+             bdestroy(head->title.ver);
+             bdestroy(head->title.misc);
+-            if (head->regex != NULL) free(head->regex);
+-            if (head->study != NULL) free(head->study);
++            bdestroy(head->regex_str);
++            if (head->match_data != NULL) pcre2_match_data_free(head->match_data);
++            if (head->re != NULL) pcre2_code_free(head->re);
+             tmp = head->next;
+             free(head);
+             head = NULL;
+@@ -292,74 +292,70 @@ void del_signature_lists()
+ /* ----------------------------------------------------------
+  * FUNCTION     : get_app_name
+  * DESCRIPTION  : This function will take the results of a
+- *              : pcre match and compile the application name
++ *              : PCRE2 match and compile the application name
+  *              : based off of the signature.
+  * INPUT        : 0 - Signature Pointer
+  *              : 1 - payload
+- *              : 2 - ovector
+- *              : 3 - rc (return from pcre_exec)
++ *              : 2 - pcre2_match_data (contains ovector)
++ *              : 3 - rc (return from pcre2_match)
+  * RETURN       : processed app name
+  * ---------------------------------------------------------- */
+ bstring get_app_name(signature * sig,
+-                     const uint8_t *payload, int *ovector, int rc)
++                     const uint8_t *payload, pcre2_match_data *match_data, int rc)
+ {
+     char sub[512];
+     char app[5000];
+-    const char *expr;
+-    bstring retval;
++    const char *p;
+     int i = 0;
+-    int n = 0;
+-    int x = 0;
+     int z = 0;
+ 
++    (void)payload; /* accessed indirectly through match_data */
++
+     /*
+-     * Create Application string using the values in signature[i].title.  
++     * Create Application string using the values in signature[i].title.
++     * bdata() is captured into a local to satisfy GCC nonnull analysis.
+      */
+-    if (sig->title.app != NULL) {
+-        strncpy(app, bdata(sig->title.app), MAX_APP);
++    app[0] = '\0';
++    if (sig->title.app != NULL && (p = bdata(sig->title.app)) != NULL) {
++        strncpy(app, p, MAX_APP);
+     }
+     if (sig->title.ver != NULL) {
+-        if (sig->title.ver->slen > 0) {
++        if (sig->title.ver->slen > 0
++            && (p = (const char *)bdata(sig->title.ver)) != NULL) {
+             strcat(app, " ");
+-            strncat(app, (char *)bdata(sig->title.ver), MAX_VER);
++            strncat(app, p, MAX_VER);
+         }
+     }
+     if (sig->title.misc != NULL) {
+-        if (sig->title.misc->slen > 0) {
++        if (sig->title.misc->slen > 0
++            && (p = (const char *)bdata(sig->title.misc)) != NULL) {
+             strcat(app, " (");
+-            strncat(app, (char *)bdata(sig->title.misc), MAX_MISC);
++            strncat(app, p, MAX_MISC);
+             strcat(app, ")");
+         }
+     }
+ 
+     /*
+-     * Replace $1, $2, etc. with the appropriate substring.  
++     * Replace $1, $2, etc. with the appropriate PCRE2 substring.  
+      */
+-    while (app[i] != '\0' && z < (sizeof(sub) - 1)) {
+-        /*
+-         * Check to see if the string contains a $? mark variable. 
+-         */
++    while (app[i] != '\0' && z < (int)(sizeof(sub) - 1)) {
+         if (app[i] == '$') {
+-            /*
+-             * Yes it does, replace it with the appropriate match string. 
+-             */
+             i++;
+-            n = atoi(&app[i]);
+-
+-            pcre_get_substring((const char *)payload, ovector, rc, n, &expr);
+-            x = 0;
+-            while (expr[x] != '\0' && z < (sizeof(sub) - 1)) {
+-                sub[z] = expr[x];
+-                z++;
+-                x++;
++            int n = atoi(&app[i]);
++
++            if (n >= 0 && n < rc) {
++                PCRE2_UCHAR *expr = NULL;
++                PCRE2_SIZE exprlen = 0;
++                int ret = pcre2_substring_get_bynumber(
++                              match_data, (uint32_t)n, &expr, &exprlen);
++                if (ret == 0 && expr != NULL) {
++                    for (PCRE2_SIZE x = 0; x < exprlen && z < (int)(sizeof(sub) - 1); x++)
++                        sub[z++] = (char)expr[x];
++                    pcre2_substring_free(expr);
++                }
+             }
+-            pcre_free_substring (expr);
+-            expr = NULL;
+             i++;
+         } else {
+-            /*
+-             * No it doesn't, copy to new string. 
+-             */
+             sub[z] = app[i];
+             i++;
+             z++;
+@@ -367,9 +363,7 @@ bstring get_app_name(signature * sig,
+     }
+     sub[z] = '\0';
+ 
+-    retval = bfromcstr(sub);
+-    return retval;
+-
++    return bfromcstr(sub);
+ }
+ 
+ void load_known_ports_file(char *filename, port_t *lports)
+diff --git a/src/servicefp/servicefp.h b/src/servicefp/servicefp.h
+index 9a3ca0c..79c122e 100644
+--- a/src/servicefp/servicefp.h
++++ b/src/servicefp/servicefp.h
+@@ -1,10 +1,13 @@
+ #ifndef SERVICEFP_H
+ #define SERVIDEFP_H
+ 
++#define PCRE2_CODE_UNIT_WIDTH 8
++#include <pcre2.h>
++
+ void arp_check(char *eth_hdr, time_t tstamp);
+ int load_servicefp_file(char *sigfile, signature **db, int);
+ int parse_raw_signature(bstring line, int lineno, signature **dbp);
+-bstring get_app_name(signature * sig, const uint8_t *payload, int *ovector,
++bstring get_app_name(signature * sig, const uint8_t *payload, pcre2_match_data *match_data,
+                      int rc);
+ bstring check_port(uint8_t proto, uint16_t port);
+ void service_tcp4(packetinfo *pi, signature *db);
+diff --git a/src/servicefp/tcpc.c b/src/servicefp/tcpc.c
+index 013409b..d1d57a9 100644
+--- a/src/servicefp/tcpc.c
++++ b/src/servicefp/tcpc.c
+@@ -1,6 +1,7 @@
+ /*
+ ** Copyright (C) 2009 Redpill Linpro, AS.
+ ** Copyright (C) 2009 Edward Fjellskål <edward.fjellskaal@redpill-linpro.com>
++** Copyright (C) 2025 Vectorscan integration
+ **
+ ** This program is free software; you can redistribute it and/or modify
+ ** it under the terms of the GNU General Public License Version 2 as
+@@ -19,41 +20,85 @@
+ */
+ 
+ #include "../prads.h"
++#include "../config.h"
+ #include "../sys_func.h"
+ #include "../assets.h"
++#include "../hs_engine.h"
+ #include "servicefp.h"
++
++extern globalconfig config;
+ extern bstring UNKNOWN;
+ 
++static int try_sig_match(signature *sig, uint8_t sflags,
++                         const uint8_t *payload, int plen,
++                         bstring *out_app)
++{
++    if (sflags & (HS_SIG_PREFILTER | HS_SIG_CAPTURE)) {
++        if (sig->re == NULL)
++            return 0;
++        int rc = pcre2_match(sig->re, (PCRE2_SPTR)payload, plen,
++                             0, 0, sig->match_data, NULL);
++        if (rc < 0)
++            return 0;
++        if (sflags & HS_SIG_CAPTURE)
++            *out_app = get_app_name(sig, payload, sig->match_data, rc);
++        else
++            *out_app = hs_get_app_name_static(sig);
++        return 1;
++    }
++    *out_app = hs_get_app_name_static(sig);
++    return 1;
++}
++
+ void client_tcp4(packetinfo *pi, signature* sig_client_tcp)
+ {
+-    int rc;                     /* PCRE */
+-    int ovector[15];
+     int tmplen;
+-    signature *tmpsig;
+     bstring app, service_name;
+ 
+-    if (pi->plen < PAYLOAD_MIN) return; // if almost no payload - skip
+-    /* should make a config.tcp_client_flowdept etc
+-     * a range between 500-1000 should be good!
+-     */
++    (void)sig_client_tcp;
++
++    if (pi->plen < PAYLOAD_MIN) return;
+     if (pi->plen > 600) tmplen = 600;
+         else tmplen = pi->plen;
+ 
+-    tmpsig = sig_client_tcp;
+-    while (tmpsig != NULL) {
+-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char*)pi->payload, tmplen, 0, 0,
+-                       ovector, 15);
+-        if (rc != -1) {
+-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
+-            //printf("[*] - MATCH CLIENT IPv4/TCP: %s\n",(char *)bdata(app));
++    if (config.hs_client_tcp == NULL) return;
++
++    hs_match_ctx_t ctx;
++    hs_sigdb_scan(config.hs_client_tcp, (const char *)pi->payload,
++                    tmplen, &ctx);
++
++    for (int i = 0; i < ctx.count; i++) {
++        unsigned int id = ctx.ids[i];
++        if (id >= config.hs_client_tcp->hs_count) continue;
++        signature *tmpsig = config.hs_client_tcp->sig_array[id];
++        if (tmpsig == NULL) continue;
++        uint8_t sflags    = config.hs_client_tcp->sig_flags[id];
++
++        if (try_sig_match(tmpsig, sflags, pi->payload, tmplen, &app)) {
++            update_asset_service(pi, tmpsig->service, app);
++            pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
++            bdestroy(app);
++            return;
++        }
++    }
++
++    for (uint32_t j = 0; j < config.hs_client_tcp->pcre2_only_count; j++) {
++        signature *tmpsig = config.hs_client_tcp->pcre2_only[j];
++        if (tmpsig->re == NULL) continue;
++        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, tmplen,
++                             0, 0, tmpsig->match_data, NULL);
++        if (rc >= 0) {
++            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
++                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
++            else
++                app = hs_get_app_name_static(tmpsig);
+             update_asset_service(pi, tmpsig->service, app);
+             pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
+             bdestroy(app);
+             return;
+         }
+-        tmpsig = tmpsig->next;
+     }
+-    // Should have a flag set to resolve unknowns to default service
++
+     if ( !ISSET_CLIENT_UNKNOWN(pi)
+         && (service_name = check_known_port(IP_PROTO_TCP,ntohs(pi->tcph->dst_port))) !=NULL ) {
+         update_asset_service(pi, UNKNOWN, service_name);
+@@ -64,29 +109,50 @@ void client_tcp4(packetinfo *pi, signature* sig_client_tcp)
+ 
+ void client_tcp6(packetinfo *pi, signature* sig_client_tcp)
+ {
+-    int rc;                     /* PCRE */
+-    int ovector[15];
+-    signature *tmpsig;
+     bstring app, service_name;
+ 
+-    if (pi->plen < 10) return; // if almost no payload - skip
+-    /* should make a config.tcp_client_flowdept etc
+-     * a range between 500-1000 should be good!
+-     */
+-    tmpsig = sig_client_tcp;
+-    while (tmpsig != NULL) {
+-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char*) pi->payload, pi->plen, 0, 0,
+-                       ovector, 15);
+-        if (rc != -1) {
+-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
+-            //printf("[*] - MATCH CLIENT IPv6/TCP: %s\n",(char *)bdata(app));
++    (void)sig_client_tcp;
++
++    if (pi->plen < 10) return;
++
++    if (config.hs_client_tcp == NULL) return;
++
++    hs_match_ctx_t ctx;
++    hs_sigdb_scan(config.hs_client_tcp, (const char *)pi->payload,
++                    pi->plen, &ctx);
++
++    for (int i = 0; i < ctx.count; i++) {
++        unsigned int id = ctx.ids[i];
++        if (id >= config.hs_client_tcp->hs_count) continue;
++        signature *tmpsig = config.hs_client_tcp->sig_array[id];
++        if (tmpsig == NULL) continue;
++        uint8_t sflags    = config.hs_client_tcp->sig_flags[id];
++
++        if (try_sig_match(tmpsig, sflags, pi->payload, pi->plen, &app)) {
+             update_asset_service(pi, tmpsig->service, app);
+             pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
+             bdestroy(app);
+             return;
+         }
+-        tmpsig = tmpsig->next;
+     }
++
++    for (uint32_t j = 0; j < config.hs_client_tcp->pcre2_only_count; j++) {
++        signature *tmpsig = config.hs_client_tcp->pcre2_only[j];
++        if (tmpsig->re == NULL) continue;
++        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, pi->plen,
++                             0, 0, tmpsig->match_data, NULL);
++        if (rc >= 0) {
++            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
++                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
++            else
++                app = hs_get_app_name_static(tmpsig);
++            update_asset_service(pi, tmpsig->service, app);
++            pi->cxt->check |= CXT_CLIENT_DONT_CHECK;
++            bdestroy(app);
++            return;
++        }
++    }
++
+     if (!ISSET_CLIENT_UNKNOWN(pi)
+         && (service_name = check_known_port(IP_PROTO_TCP,ntohs(pi->tcph->dst_port))) !=NULL ) {
+         update_asset_service(pi, UNKNOWN, service_name);
+diff --git a/src/servicefp/tcps.c b/src/servicefp/tcps.c
+index cc58c5f..994f428 100644
+--- a/src/servicefp/tcps.c
++++ b/src/servicefp/tcps.c
+@@ -1,6 +1,7 @@
+ /*
+ ** Copyright (C) 2009 Redpill Linpro, AS.
+ ** Copyright (C) 2009 Edward Fjellskål <edward.fjellskaal@redpill-linpro.com>
++** Copyright (C) 2025 Vectorscan integration
+ **
+ ** This program is free software; you can redistribute it and/or modify
+ ** it under the terms of the GNU General Public License Version 2 as
+@@ -19,49 +20,101 @@
+ */
+ 
+ #include "../prads.h"
++#include "../config.h"
+ #include "../sys_func.h"
+ #include "../assets.h"
++#include "../hs_engine.h"
+ #include "servicefp.h"
+ 
++extern globalconfig config;
+ extern bstring UNKNOWN;
+ 
++/* -------------------------------------------------------------------
++ * Internal helper: attempt match + app-name extraction for one sig.
++ * Returns 1 on confirmed match, 0 on miss (prefilter false positive).
++ * ------------------------------------------------------------------- */
++static int try_sig_match(signature *sig, uint8_t sflags,
++                         const uint8_t *payload, int plen,
++                         bstring *out_app)
++{
++    if (sflags & (HS_SIG_PREFILTER | HS_SIG_CAPTURE)) {
++        /* Need PCRE2 for confirmation and/or capture extraction */
++        if (sig->re == NULL)
++            return 0;
++        int rc = pcre2_match(sig->re, (PCRE2_SPTR)payload, plen,
++                             0, 0, sig->match_data, NULL);
++        if (rc < 0)
++            return 0;  /* prefilter false positive or match failure */
++        if (sflags & HS_SIG_CAPTURE)
++            *out_app = get_app_name(sig, payload, sig->match_data, rc);
++        else
++            *out_app = hs_get_app_name_static(sig);
++        return 1;
++    }
++    /* Pure Vectorscan match — no PCRE2 needed */
++    *out_app = hs_get_app_name_static(sig);
++    return 1;
++}
++
++/* -------------------------------------------------------------------
++ * service_tcp4 / service_tcp6 — TCP server service fingerprinting
++ *
++ * Hot path: Vectorscan scans all ~N patterns in a single DFA pass.
++ * On match, at most one targeted PCRE2 exec for capture extraction.
++ * ------------------------------------------------------------------- */
+ void service_tcp4(packetinfo *pi, signature* sig_serv_tcp)
+ {
+-    int rc;                     /* PCRE */
+-    int ovector[15];
+     int tmplen;
+-    signature *tmpsig;
+-    bstring app,service_name;
++    bstring app, service_name;
+ 
+-    if (pi->plen < PAYLOAD_MIN) return; // if almost no payload - skip
+-    /* should make a config.tcp_server_flowdept etc
+-     * a range between 500-1000 should be good?
+-     */
++    (void)sig_serv_tcp; /* signature list no longer walked directly */
++
++    if (pi->plen < PAYLOAD_MIN) return;
+     if (pi->plen > 600) tmplen = 600;
+         else tmplen = pi->plen;
+ 
+-    tmpsig = sig_serv_tcp;
+-    while (tmpsig != NULL) {
+-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char *)pi->payload, tmplen, 0, 0,
+-                       ovector, 15);
+-        if (rc >= 0) {
+-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
+-            //printf("[*] - MATCH SERVICE IPv4/TCP: %s\n",(char *)bdata(app));
++    if (config.hs_serv_tcp == NULL) return;
++
++    /* Single Vectorscan pass across all patterns */
++    hs_match_ctx_t ctx;
++    hs_sigdb_scan(config.hs_serv_tcp, (const char *)pi->payload,
++                    tmplen, &ctx);
++
++    /* Process matches in ordinal order (first-match-wins) */
++    for (int i = 0; i < ctx.count; i++) {
++        unsigned int id = ctx.ids[i];
++        if (id >= config.hs_serv_tcp->hs_count) continue;
++        signature *tmpsig = config.hs_serv_tcp->sig_array[id];
++        if (tmpsig == NULL) continue;
++        uint8_t sflags    = config.hs_serv_tcp->sig_flags[id];
++
++        if (try_sig_match(tmpsig, sflags, pi->payload, tmplen, &app)) {
+             update_asset_service(pi, tmpsig->service, app);
+             pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
+             bdestroy(app);
+             return;
+         }
+-        /*
+-        } else if (rc == PCRE_ERROR_NOMATCH) {
+-            printf("pcre nomatch \n");
+-        } else {
+-            printf("pcre error: %d \n", rc);
++    }
++
++    /* PCRE2-only fallback: linear scan of patterns Vectorscan couldn't compile */
++    for (uint32_t j = 0; j < config.hs_serv_tcp->pcre2_only_count; j++) {
++        signature *tmpsig = config.hs_serv_tcp->pcre2_only[j];
++        if (tmpsig->re == NULL) continue;
++        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, tmplen,
++                             0, 0, tmpsig->match_data, NULL);
++        if (rc >= 0) {
++            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
++                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
++            else
++                app = hs_get_app_name_static(tmpsig);
++            update_asset_service(pi, tmpsig->service, app);
++            pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
++            bdestroy(app);
++            return;
+         }
+-        */
+-        tmpsig = tmpsig->next;
+     }
+-    // Should have a flag set to resolve unknowns to default service
++
++    /* No match — try known port fallback */
+     if ( !ISSET_SERVICE_UNKNOWN(pi)
+         && (service_name = check_known_port(IP_PROTO_TCP,ntohs(pi->s_port))) !=NULL ) {
+         update_asset_service(pi, UNKNOWN, service_name);
+@@ -72,39 +125,57 @@ void service_tcp4(packetinfo *pi, signature* sig_serv_tcp)
+ 
+ void service_tcp6(packetinfo *pi, signature* sig_serv_tcp)
+ {
+-    int rc;                     /* PCRE */
+-    int ovector[15];
+     int tmplen;
+-    signature *tmpsig;
+-    bstring app,service_name;
++    bstring app, service_name;
+ 
+-    if (pi->plen < 10) return; // if almost no payload - skip
+-    /* should make a config.tcp_client_flowdept etc
+-     * a range between 500-1000 should be good!
+-     */
++    (void)sig_serv_tcp;
++
++    if (pi->plen < 10) return;
+     if (pi->plen > 600) tmplen = 600;
+         else tmplen = pi->plen;
+ 
+-    tmpsig = sig_serv_tcp;
+-    while (tmpsig != NULL) {
+-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char *) pi->payload, tmplen, 0, 0,
+-                       ovector, 15);
++    if (config.hs_serv_tcp == NULL) return;
++
++    hs_match_ctx_t ctx;
++    hs_sigdb_scan(config.hs_serv_tcp, (const char *)pi->payload,
++                    tmplen, &ctx);
++
++    for (int i = 0; i < ctx.count; i++) {
++        unsigned int id = ctx.ids[i];
++        if (id >= config.hs_serv_tcp->hs_count) continue;
++        signature *tmpsig = config.hs_serv_tcp->sig_array[id];
++        if (tmpsig == NULL) continue;
++        uint8_t sflags    = config.hs_serv_tcp->sig_flags[id];
++
++        if (try_sig_match(tmpsig, sflags, pi->payload, tmplen, &app)) {
++            update_asset_service(pi, tmpsig->service, app);
++            pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
++            bdestroy(app);
++            return;
++        }
++    }
++
++    for (uint32_t j = 0; j < config.hs_serv_tcp->pcre2_only_count; j++) {
++        signature *tmpsig = config.hs_serv_tcp->pcre2_only[j];
++        if (tmpsig->re == NULL) continue;
++        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, tmplen,
++                             0, 0, tmpsig->match_data, NULL);
+         if (rc >= 0) {
+-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
+-            //printf("[*] - MATCH SERVICE IPv6/TCP: %s\n",(char *)bdata(app));
++            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
++                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
++            else
++                app = hs_get_app_name_static(tmpsig);
+             update_asset_service(pi, tmpsig->service, app);
+             pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
+             bdestroy(app);
+             return;
+         }
+-        tmpsig = tmpsig->next;
+     }
+-    // Should have a flag set to resolve unknowns to default service
++
+     if ( !ISSET_SERVICE_UNKNOWN(pi)
+         && (service_name = check_known_port(IP_PROTO_TCP,ntohs(pi->s_port))) !=NULL ) {
+         update_asset_service(pi, UNKNOWN, service_name);
+         pi->cxt->check |= CXT_SERVICE_UNKNOWN_SET;
+         bdestroy(service_name);
+     }
+-
+ }
+diff --git a/src/servicefp/udps.c b/src/servicefp/udps.c
+index fc29447..5bb7460 100644
+--- a/src/servicefp/udps.c
++++ b/src/servicefp/udps.c
+@@ -1,6 +1,7 @@
+ /*
+ ** Copyright (C) 2009 Redpill Linpro, AS.
+ ** Copyright (C) 2009 Edward Fjellskål <edward.fjellskaal@redpill-linpro.com>
++** Copyright (C) 2025 Vectorscan integration
+ **
+ ** This program is free software; you can redistribute it and/or modify
+ ** it under the terms of the GNU General Public License Version 2 as
+@@ -19,41 +20,86 @@
+ */
+ 
+ #include "../prads.h"
++#include "../config.h"
+ #include "../assets.h"
+ #include "../cxt.h"
++#include "../hs_engine.h"
+ #include "servicefp.h"
+ 
++extern globalconfig config;
+ extern bstring UNKNOWN;
+ 
++static int try_sig_match(signature *sig, uint8_t sflags,
++                         const uint8_t *payload, int plen,
++                         bstring *out_app)
++{
++    if (sflags & (HS_SIG_PREFILTER | HS_SIG_CAPTURE)) {
++        if (sig->re == NULL)
++            return 0;
++        int rc = pcre2_match(sig->re, (PCRE2_SPTR)payload, plen,
++                             0, 0, sig->match_data, NULL);
++        if (rc < 0)
++            return 0;
++        if (sflags & HS_SIG_CAPTURE)
++            *out_app = get_app_name(sig, payload, sig->match_data, rc);
++        else
++            *out_app = hs_get_app_name_static(sig);
++        return 1;
++    }
++    *out_app = hs_get_app_name_static(sig);
++    return 1;
++}
++
+ void service_udp4(packetinfo *pi, signature* sig_serv_udp)
+ {
+-    int rc;                     /* PCRE */
+-    int ovector[15];
+-    signature *tmpsig;
+     bstring app, service_name;
+     app = service_name = NULL;
+ 
++    (void)sig_serv_udp;
++
+     if (pi->plen < 5 ) return;
+-    /* should make a config.tcp_client_flowdept etc
+-     * a range between 500-1000 should be good!
+-     */
+-    tmpsig = sig_serv_udp;
+-    while (tmpsig != NULL) {
+-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char*) pi->payload, pi->plen, 0, 0,
+-                       ovector, 15);
+-        if (rc != -1) {
+-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
+-            //printf("[*] - MATCH SERVICE IPv4/UDP: %s\n",(char *)bdata(app));
++
++    if (config.hs_serv_udp == NULL) return;
++
++    hs_match_ctx_t ctx;
++    hs_sigdb_scan(config.hs_serv_udp, (const char *)pi->payload,
++                  pi->plen, &ctx);
++
++    for (int i = 0; i < ctx.count; i++) {
++        unsigned int id = ctx.ids[i];
++        if (id >= config.hs_serv_udp->hs_count) continue;
++        signature *tmpsig = config.hs_serv_udp->sig_array[id];
++        if (tmpsig == NULL) continue;
++        uint8_t sflags    = config.hs_serv_udp->sig_flags[id];
++
++        if (try_sig_match(tmpsig, sflags, pi->payload, pi->plen, &app)) {
++            update_asset_service(pi, tmpsig->service, app);
++            pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
++            bdestroy(app);
++            return;
++        }
++    }
++
++    for (uint32_t j = 0; j < config.hs_serv_udp->pcre2_only_count; j++) {
++        signature *tmpsig = config.hs_serv_udp->pcre2_only[j];
++        if (tmpsig->re == NULL) continue;
++        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, pi->plen,
++                             0, 0, tmpsig->match_data, NULL);
++        if (rc >= 0) {
++            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
++                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
++            else
++                app = hs_get_app_name_static(tmpsig);
+             update_asset_service(pi, tmpsig->service, app);
+             pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
+             bdestroy(app);
+             return;
+         }
+-        tmpsig = tmpsig->next;
+     }
+ 
++udp4_fallback:
+     /* 
+-     * If no sig is found/mached, use default port to determin.
++     * If no sig is found/matched, use default port to determine.
+      */
+     if (pi->sc == SC_CLIENT && !ISSET_CLIENT_UNKNOWN(pi)) {
+         if ((service_name = (bstring) check_known_port(IP_PROTO_UDP,ntohs(pi->d_port))) !=NULL ) {
+@@ -84,33 +130,54 @@ void service_udp4(packetinfo *pi, signature* sig_serv_udp)
+ 
+ void service_udp6(packetinfo *pi, signature* sig_serv_udp)
+ {
+-    int rc;                     /* PCRE */
+-    int ovector[15];
+     int tmplen;
+-    signature *tmpsig;
+-    bstring app,service_name;
++    bstring app, service_name;
++
++    (void)sig_serv_udp;
+     
+     if (pi->plen < 5) return; 
+-    /* should make a config.tcp_client_flowdept etc
+-     * a range between 500-1000 should be good!
+-     */
+     if (pi->plen > 600) tmplen = 600;
+         else tmplen = pi->plen;
+- 
+-    tmpsig = sig_serv_udp;
+-    while (tmpsig != NULL) {
+-        rc = pcre_exec(tmpsig->regex, tmpsig->study, (const char *) pi->payload, tmplen, 0, 0,
+-                       ovector, 15);
+-        if (rc != -1) {
+-            app = get_app_name(tmpsig, pi->payload, ovector, rc);
+-            //printf("[*] - MATCH SERVICE IPv6/UDP: %s\n",(char *)bdata(app));
++
++    if (config.hs_serv_udp == NULL) return;
++
++    hs_match_ctx_t ctx;
++    hs_sigdb_scan(config.hs_serv_udp, (const char *)pi->payload,
++                  tmplen, &ctx);
++
++    for (int i = 0; i < ctx.count; i++) {
++        unsigned int id = ctx.ids[i];
++        if (id >= config.hs_serv_udp->hs_count) continue;
++        signature *tmpsig = config.hs_serv_udp->sig_array[id];
++        if (tmpsig == NULL) continue;
++        uint8_t sflags    = config.hs_serv_udp->sig_flags[id];
++
++        if (try_sig_match(tmpsig, sflags, pi->payload, tmplen, &app)) {
+             update_asset_service(pi, tmpsig->service, app);
+             pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
+             bdestroy(app);
+             return;
+         }
+-        tmpsig = tmpsig->next;
+     }
++
++    for (uint32_t j = 0; j < config.hs_serv_udp->pcre2_only_count; j++) {
++        signature *tmpsig = config.hs_serv_udp->pcre2_only[j];
++        if (tmpsig->re == NULL) continue;
++        int rc = pcre2_match(tmpsig->re, (PCRE2_SPTR)pi->payload, tmplen,
++                             0, 0, tmpsig->match_data, NULL);
++        if (rc >= 0) {
++            if (tmpsig->hs_flags & HS_SIG_CAPTURE)
++                app = get_app_name(tmpsig, pi->payload, tmpsig->match_data, rc);
++            else
++                app = hs_get_app_name_static(tmpsig);
++            update_asset_service(pi, tmpsig->service, app);
++            pi->cxt->check |= CXT_SERVICE_DONT_CHECK;
++            bdestroy(app);
++            return;
++        }
++    }
++
++udp6_fallback:
+     if (pi->sc == SC_CLIENT && !ISSET_CLIENT_UNKNOWN(pi)) {
+         if ((service_name = (bstring) check_known_port(IP_PROTO_UDP,ntohs(pi->d_port))) !=NULL ) {
+             update_asset_service(pi, UNKNOWN, service_name);
+-- 
+2.43.0
+

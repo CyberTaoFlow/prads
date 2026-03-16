@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""prads-asset-report — Generate formatted asset reports from PRADS logs.
+
+Improvements over the original:
+- OS inference from service banners and client fingerprints (User-Agent,
+  CryptoAPI, WUA, aws-sdk, CPE, device strings)
+- OS transition detection (re-image / migration indicators)
+- Deduplicated output (latest per port, normalized client entries)
+- CPE and structured client application info
+- JSON output conforming to Elastic Common Schema (ECS)
+- Text report with inference source detail
+"""
+
+import argparse
+import json
+import os
+import socket
+import struct
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prads_utils import (
+    parse_log_file, guess_os, get_latest_services, get_deduplicated_clients,
+    format_timestamp, host_to_ecs, host_to_report_dict, ip_sort_key,
+)
+
+__version__ = '2.0'
+__date__ = '2026-03-13'
+
+
+# ── RFC 1918 check ──────────────────────────────────────────────────────────
+
+def _ip_to_int(ip):
+    try:
+        return struct.unpack('!I', socket.inet_aton(ip))[0]
+    except (OSError, socket.error):
+        return None
+
+_RFC1918 = [
+    (_ip_to_int('10.0.0.0'),    0xFF000000),
+    (_ip_to_int('172.16.0.0'),  0xFFF00000),
+    (_ip_to_int('192.168.0.0'), 0xFFFF0000),
+]
+
+def is_rfc1918(ip):
+    n = _ip_to_int(ip)
+    if n is None:
+        return False
+    return any((n & mask) == net for net, mask in _RFC1918)
+
+
+def resolve_dns(ip, private_only=False):
+    """Reverse DNS lookup with forward validation."""
+    if private_only and not is_rfc1918(ip):
+        return None
+    try:
+        host, _, _ = socket.gethostbyaddr(ip)
+    except (socket.herror, socket.gaierror, OSError):
+        return None
+
+    result = host
+    # Forward-validate
+    try:
+        fwd = socket.gethostbyname(host + '.')
+        if fwd != ip:
+            result += f' ({fwd})'
+            try:
+                rev2, _, _ = socket.gethostbyaddr(fwd)
+                if rev2 != host:
+                    result += f' [{rev2}]'
+            except (socket.herror, socket.gaierror, OSError):
+                pass
+    except (socket.herror, socket.gaierror, OSError):
+        result += ' (dnswall: no such domain)'
+
+    return result
+
+
+# ── Text report formatter ──────────────────────────────────────────────────
+
+def print_text_report(hosts, args):
+    """Print human-readable asset report."""
+    idx = 1
+    for ip in sorted(hosts, key=ip_sort_key):
+        host = hosts[ip]
+        os_info = guess_os(host)
+        cutoff = (os_info['timestamp'] or 0) - 43200
+        services = get_latest_services(host, cutoff)
+        clients  = get_deduplicated_clients(host, cutoff)
+
+        print(f'{idx} {"─" * 54}')
+        print(f'IP:   {ip}')
+
+        # DNS
+        if not args.no_dns:
+            dns = resolve_dns(ip, private_only=args.private_only)
+            if dns:
+                print(f'DNS:  {dns}')
+
+        # OS
+        conf = os_info['confidence']
+        det = os_info['details']
+        os_line = f"OS:   {os_info['os']}"
+        if det and det != 'unknown':
+            os_line += f' — {det}'
+        os_line += f' ({conf}%)'
+        if os_info['flux'] > 0:
+            os_line += f'  *** {os_info["flux"]} OS transition(s) detected ***'
+        print(os_line)
+
+        # Inference sources (top 5)
+        sources = os_info['inference_sources'][:5]
+        if sources:
+            print(f'      Evidence: {"; ".join(sources)}')
+
+        # OS transitions
+        for t in os_info['transitions']:
+            print(f'      TRANSITION: {t["from_os"]} → {t["to_os"]}'
+                  f' at {format_timestamp(t["to_ts"])}'
+                  f' ({t["to_details"]})')
+
+        # Time range
+        if host.first_seen and host.last_seen:
+            print(f'Seen: {format_timestamp(host.first_seen)}'
+                  f' — {format_timestamp(host.last_seen)}')
+
+        # VLANs
+        if host.vlans:
+            print(f'VLAN: {", ".join(str(v) for v in sorted(host.vlans))}')
+
+        # MAC addresses (deduplicated, with OUI vendor)
+        seen_macs = set()
+        first_mac = True
+        for mac, vendor_short, vendor_full, ts in host.arp_entries:
+            if mac in seen_macs:
+                continue
+            seen_macs.add(mac)
+            label = 'MAC:  ' if first_mac else '      '
+            vendor_str = ''
+            if vendor_short:
+                vendor_str = f'  [{vendor_full or vendor_short}]'
+            print(f'{label}{mac}{vendor_str}  ({format_timestamp(ts)})')
+            first_mac = False
+
+        # ICMP
+        if host.has_icmp:
+            print('ICMP: Enabled')
+
+        # CPEs
+        seen_cpes = set()
+        for c in host.cpes:
+            if c['raw'] not in seen_cpes:
+                seen_cpes.add(c['raw'])
+        if seen_cpes:
+            print(f'CPE:  {", ".join(sorted(seen_cpes))}')
+
+        print()
+
+        # TCP services
+        tcp_svc = services['tcp']
+        if tcp_svc:
+            print(f'{"Port":<7} {"Service":<12} {"TCP Application"}')
+            for port in sorted(tcp_svc):
+                svc, det, ts = tcp_svc[port]
+                print(f'{port:<7} {"SERVER":<12} {svc}:{det}')
+            print()
+
+        # UDP services
+        udp_svc = services['udp']
+        if udp_svc:
+            print(f'{"Port":<7} {"Service":<12} {"UDP Application"}')
+            for port in sorted(udp_svc):
+                svc, det, ts = udp_svc[port]
+                print(f'{port:<7} {"SERVER":<12} {svc}:{det}')
+            print()
+
+        # Clients (deduplicated, non-trivial only)
+        non_trivial = [(p, pt, s, d, t) for p, pt, s, d, t in clients
+                       if not (s == 'unknown' and d.startswith('@'))]
+        if non_trivial:
+            print(f'{"Proto":<6} {"Service":<10} {"Client Details"}')
+            for proto, port, svc, det, ts in non_trivial:
+                # Truncate long details for readability
+                disp = det if len(det) <= 100 else det[:97] + '...'
+                print(f'{proto:<6} {svc:<10} {disp}')
+            print()
+
+        # Client protocol summary (trivial @-prefixed ones)
+        trivial = {d.lstrip('@') for p, pt, s, d, t in clients
+                   if s == 'unknown' and d.startswith('@')}
+        if trivial:
+            print(f'Client protocols: {", ".join(sorted(trivial))}')
+            print()
+
+        # Parsed client applications (deduplicated)
+        if host.client_apps:
+            seen = set()
+            apps = []
+            for ua in host.client_apps:
+                key = (ua.get('browser', ''), ua.get('browser_version', ''),
+                       ua.get('application', ''), ua.get('app_version', ''),
+                       ua.get('runtime', ''), ua.get('runtime_version', ''))
+                if key not in seen and key != ('', '', '', '', '', ''):
+                    seen.add(key)
+                    apps.append(ua)
+            if apps:
+                print('Client Applications:')
+                for ua in apps:
+                    parts = []
+                    if 'browser' in ua:
+                        parts.append(f'{ua["browser"]} {ua.get("browser_version", "")}')
+                    if 'application' in ua:
+                        parts.append(f'{ua["application"]} {ua.get("app_version", "")}')
+                    if 'runtime' in ua:
+                        parts.append(f'{ua["runtime"]} {ua.get("runtime_version", "")}')
+                    if 'os' in ua:
+                        parts.append(f'[{ua["os"]}]')
+                    if 'arch' in ua:
+                        parts.append(f'({ua["arch"]})')
+                    print(f'  {" | ".join(parts)}')
+                print()
+
+        idx += 1
+
+
+# ── JSON output ─────────────────────────────────────────────────────────────
+
+def print_json_output(hosts, args, ecs=True):
+    """Print JSON output (ECS or general-purpose dict)."""
+    results = []
+    for ip in sorted(hosts, key=ip_sort_key):
+        host = hosts[ip]
+        os_info = guess_os(host)
+        cutoff = (os_info['timestamp'] or 0) - 43200
+        services = get_latest_services(host, cutoff)
+        clients  = get_deduplicated_clients(host, cutoff)
+
+        if ecs:
+            doc = host_to_ecs(host, os_info, services, clients)
+        else:
+            doc = host_to_report_dict(host, os_info, services, clients)
+        results.append(doc)
+
+    json.dump(results, sys.stdout, indent=2, default=str)
+    sys.stdout.write('\n')
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='PRADS Asset Report Generator v' + __version__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''Output formats:
+  text    Human-readable report (default)
+  json    ECS-compliant JSON for Elastic/SIEM ingestion
+  dict    General-purpose JSON (non-ECS)
+''')
+
+    parser.add_argument('-r', '--report-file',
+                        default='/var/log/prads-asset.log',
+                        help='PRADS asset log file (default: /var/log/prads-asset.log)')
+    parser.add_argument('-w', '--output-file',
+                        help='Write output to file instead of stdout')
+    parser.add_argument('-i', '--ip', help='Report only this IP address')
+    parser.add_argument('-n', '--no-dns', action='store_true',
+                        help='Do not resolve IP addresses to names')
+    parser.add_argument('-p', '--private-only', action='store_true',
+                        help='Only resolve RFC 1918 addresses')
+    parser.add_argument('-f', '--format', choices=['text', 'json', 'dict'],
+                        default='text', help='Output format (default: text)')
+    parser.add_argument('--version', action='version',
+                        version=f'prads-asset-report {__version__} ({__date__})')
+
+    args = parser.parse_args()
+
+    # Redirect stdout if output file specified
+    if args.output_file:
+        sys.stdout = open(args.output_file, 'w')
+
+    # Print header for text output
+    if args.format == 'text':
+        print(f'\n prads-asset-report — PRADS Asset Report')
+        print(f' {__version__} — {__date__}')
+        print(f' Reading: {args.report_file}')
+        print()
+
+    # Parse
+    sys.stderr.write(f'[*] Parsing {args.report_file}...\n')
+    hosts = parse_log_file(args.report_file, filter_ip=args.ip)
+    sys.stderr.write(f'[*] Found {len(hosts)} unique hosts\n')
+
+    if not hosts:
+        sys.stderr.write('[*] No assets found.\n')
+        return
+
+    # Output
+    if args.format == 'text':
+        print_text_report(hosts, args)
+        # Summary
+        os_counts = {}
+        for ip, host in hosts.items():
+            oi = guess_os(host)
+            os_counts[oi['os']] = os_counts.get(oi['os'], 0) + 1
+        print(f'\n{"=" * 56}')
+        print(f'Total hosts: {len(hosts)}')
+        for os_name in sorted(os_counts, key=os_counts.get, reverse=True):
+            print(f'  {os_name}: {os_counts[os_name]}')
+        transitions = 0
+        for ip, host in hosts.items():
+            oi = guess_os(host)
+            transitions += len(oi.get('transitions', []))
+        if transitions:
+            print(f'OS transitions detected: {transitions}')
+        print()
+    elif args.format == 'json':
+        print_json_output(hosts, args, ecs=True)
+    elif args.format == 'dict':
+        print_json_output(hosts, args, ecs=False)
+
+    if args.output_file:
+        sys.stdout.close()
+        sys.stderr.write(f'[*] Output written to {args.output_file}\n')
+
+
+if __name__ == '__main__':
+    main()

@@ -44,7 +44,9 @@
 #include "dhcp.h"
 #include <pcap.h>
 #include <pcap/pcap.h>
+#ifdef HAVE_PFRING
 #include <pfring.h>
+#endif
 //#include "output-plugins/log_init.h"
 #include "output-plugins/log.h"
 
@@ -1479,30 +1481,39 @@ int main(int argc, char *argv[])
     load_foo(load_servicefp_file, cof, CS_TCP_CLIENT, sig_file_cli_tcp, sig_client_tcp, sig_hashsize, dump_sig_service);
 
     /* -----------------------------------------------------------
-     * Compile Vectorscan multi-pattern databases from the loaded
-     * signature linked-lists.  Each database scans all patterns
-     * for its category in a single DFA pass.
+     * Build Vectorscan multi-pattern databases.  Try loading from
+     * a serialized cache first (near-instant); fall back to full
+     * compilation and cache the result for next startup.
      * ----------------------------------------------------------- */
-    if (config.sig_serv_tcp != NULL) {
-        config.hs_serv_tcp = hs_sigdb_compile(config.sig_serv_tcp, "serv_tcp");
-        if (config.hs_serv_tcp == NULL)
-            olog("[!] WARNING: Vectorscan compilation failed for TCP server sigs\n");
-    }
-    if (config.sig_serv_udp != NULL) {
-        config.hs_serv_udp = hs_sigdb_compile(config.sig_serv_udp, "serv_udp");
-        if (config.hs_serv_udp == NULL)
-            olog("[!] WARNING: Vectorscan compilation failed for UDP server sigs\n");
-    }
-    if (config.sig_client_tcp != NULL) {
-        config.hs_client_tcp = hs_sigdb_compile(config.sig_client_tcp, "client_tcp");
-        if (config.hs_client_tcp == NULL)
-            olog("[!] WARNING: Vectorscan compilation failed for TCP client sigs\n");
-    }
-    if (config.sig_client_udp != NULL) {
-        config.hs_client_udp = hs_sigdb_compile(config.sig_client_udp, "client_udp");
-        if (config.hs_client_udp == NULL)
-            olog("[!] WARNING: Vectorscan compilation failed for UDP client sigs\n");
-    }
+#define HS_COMPILE_OR_CACHE(siglist, hsdb_ptr, sig_path, label)            \
+    do {                                                                   \
+        if ((siglist) != NULL) {                                           \
+            char _cache[4096];                                             \
+            snprintf(_cache, sizeof(_cache), "%s.hsdb", (sig_path));       \
+            *(hsdb_ptr) = hs_cache_load((siglist), _cache,                 \
+                                        (sig_path), (label));              \
+            if (*(hsdb_ptr) == NULL) {                                     \
+                *(hsdb_ptr) = hs_sigdb_compile((siglist), (label));        \
+                if (*(hsdb_ptr) != NULL)                                   \
+                    hs_cache_save(*(hsdb_ptr), _cache, (sig_path),         \
+                                  (label));                                \
+                else                                                       \
+                    olog("[!] WARNING: Vectorscan compilation failed "     \
+                         "for %s\n", (label));                             \
+            }                                                              \
+        }                                                                  \
+    } while (0)
+
+    HS_COMPILE_OR_CACHE(config.sig_serv_tcp,   &config.hs_serv_tcp,
+                        config.sig_file_serv_tcp,  "serv_tcp");
+    HS_COMPILE_OR_CACHE(config.sig_serv_udp,   &config.hs_serv_udp,
+                        config.sig_file_serv_udp,  "serv_udp");
+    HS_COMPILE_OR_CACHE(config.sig_client_tcp, &config.hs_client_tcp,
+                        config.sig_file_cli_tcp,   "client_tcp");
+    HS_COMPILE_OR_CACHE(config.sig_client_udp, &config.hs_client_udp,
+                        config.sig_file_cli_udp,   "client_udp");
+
+#undef HS_COMPILE_OR_CACHE
 
     init_services();
 
@@ -1526,7 +1537,9 @@ int main(int argc, char *argv[])
 
     cxt_init();
     olog("[*] Sniffing...\n");
+#ifdef HAVE_PFRING
     pcap_set_watermark(config.handle, 128);
+#endif
     pcap_loop(config.handle, -1, got_packet, NULL);
 
     game_over();

@@ -18,6 +18,7 @@ endif
 # for using a newer libpcap
 ifneq (${PCAPDIR},)
 LDFLAGS+=-L${PCAPDIR}
+CFLAGS+=-I/usr/local/include
 else
 PCAPDIR=${LIBDIR}
 endif
@@ -33,7 +34,7 @@ ifeq (${TCMALLOC},y)
 LDFLAGS+=-ltcmalloc
 endif
 LDFLAGS+=-lpcap -lhs -lpcre2-8 -lresolv -lpfring -lrt -lnuma -lstdc++ -lm
-CFLAGS+=-DCONFDIR='"${CONFDIR}/"'
+CFLAGS+=-DCONFDIR='"${CONFDIR}/"' -DHAVE_PFRING
 
 else
 

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "prads.h"
@@ -215,9 +216,9 @@ hs_sigdb_t *hs_sigdb_compile(signature *siglist, const char *db_label)
                 goto fail_alloc;
             }
             for (uint32_t j = 0; j < batch_count; j++) {
+                hsdb->sig_flags[j] = per_sig_fl[j];
                 if (!active[j]) continue;
                 hsdb->sig_array[j] = sig_map[j];
-                hsdb->sig_flags[j] = per_sig_fl[j];
             }
 
             /* Compile PCRE2 patterns for sigs that need captures or prefilter confirm */
@@ -448,8 +449,11 @@ bstring hs_get_app_name_pcre2(signature *sig, const uint8_t *payload,
                 int ret = pcre2_substring_get_bynumber(
                               match_data, (uint32_t)n, &substr, &sublen);
                 if (ret == 0 && substr != NULL) {
-                    for (PCRE2_SIZE x = 0; x < sublen && z < (int)(sizeof(sub) - 1); x++)
-                        sub[z++] = (char)substr[x];
+                    for (PCRE2_SIZE x = 0; x < sublen && z < (int)(sizeof(sub) - 1); x++) {
+                        unsigned char c = (unsigned char)substr[x];
+                        if (c >= 0x20 && c != 0x7f)
+                            sub[z++] = (char)c;
+                    }
                     pcre2_substring_free(substr);
                 }
             }
@@ -493,4 +497,280 @@ bstring hs_get_app_name_static(signature *sig)
 const char *hs_engine_version(void)
 {
     return hs_version();
+}
+
+/* ===================================================================
+ * Serialized database cache
+ * =================================================================== */
+
+#define HS_CACHE_MAGIC      "PRADS_HSDB_V1"
+#define HS_CACHE_MAGIC_SIZE 16
+#define HS_CACHE_VER_SIZE   32
+
+typedef struct {
+    char     magic[HS_CACHE_MAGIC_SIZE];
+    char     hs_ver[HS_CACHE_VER_SIZE];  /* Vectorscan version string     */
+    uint64_t sig_hash;                   /* FNV-1a of sig file contents   */
+    uint32_t batch_count;                /* Number of pattern slots       */
+    uint32_t hsdb_size;                  /* Serialized HS database bytes  */
+} hs_cache_header_t;
+
+/* FNV-1a 64-bit constants */
+#define FNV1A_64_INIT  0xcbf29ce484222325ULL
+#define FNV1A_64_PRIME 0x100000001b3ULL
+
+static uint64_t fnv1a_hash_file(const char *path)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+
+    uint64_t h = FNV1A_64_INIT;
+    uint8_t buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            h ^= buf[i];
+            h *= FNV1A_64_PRIME;
+        }
+    }
+    fclose(fp);
+    return h;
+}
+
+/* Count signatures with valid regex in the linked list */
+static uint32_t count_valid_sigs(signature *siglist)
+{
+    uint32_t n = 0;
+    for (signature *s = siglist; s != NULL; s = s->next) {
+        if (s->regex_str != NULL && bdata(s->regex_str) != NULL
+            && s->regex_str->slen > 0)
+            n++;
+    }
+    return n;
+}
+
+/* Compile a PCRE2 pattern for a signature (helper for cache load) */
+static void compile_pcre2_for_sig(signature *s)
+{
+    const char *pat = (const char *)bdata(s->regex_str);
+    if (pat == NULL) return;
+    int errcode;
+    PCRE2_SIZE errofs;
+    s->re = pcre2_compile((PCRE2_SPTR)pat, PCRE2_ZERO_TERMINATED,
+                          PCRE2_DOTALL, &errcode, &errofs, NULL);
+    if (s->re != NULL)
+        s->match_data = pcre2_match_data_create_from_pattern(s->re, NULL);
+}
+
+/* -------------------------------------------------------------------
+ * hs_cache_save
+ * ------------------------------------------------------------------- */
+int hs_cache_save(const hs_sigdb_t *hsdb, const char *cache_path,
+                  const char *sig_file_path, const char *db_label)
+{
+    if (!hsdb || !hsdb->db || !cache_path || !sig_file_path)
+        return -1;
+
+    /* Serialize the HS database to a byte blob */
+    char *serialized = NULL;
+    size_t serialized_len = 0;
+    hs_error_t ret = hs_serialize_database(hsdb->db, &serialized,
+                                           &serialized_len);
+    if (ret != HS_SUCCESS) {
+        olog("[!] hs_cache_save(%s): hs_serialize_database failed (%d)\n",
+             db_label, ret);
+        return -1;
+    }
+
+    /* Build header */
+    hs_cache_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    strncpy(hdr.magic, HS_CACHE_MAGIC, HS_CACHE_MAGIC_SIZE);
+    strncpy(hdr.hs_ver, hs_version(), HS_CACHE_VER_SIZE);
+    hdr.sig_hash    = fnv1a_hash_file(sig_file_path);
+    hdr.batch_count = hsdb->hs_count;
+    hdr.hsdb_size   = (uint32_t)serialized_len;
+
+    /* Write cache file */
+    FILE *fp = fopen(cache_path, "wb");
+    if (!fp) {
+        dlog("[*] hs_cache_save(%s): cannot write %s (non-fatal)\n",
+             db_label, cache_path);
+        free(serialized);
+        return -1;
+    }
+
+    size_t written = 0;
+    written += fwrite(&hdr, 1, sizeof(hdr), fp);
+    written += fwrite(hsdb->sig_flags, 1, hsdb->hs_count, fp);
+    written += fwrite(serialized, 1, serialized_len, fp);
+    fclose(fp);
+    free(serialized);
+
+    size_t expected = sizeof(hdr) + hsdb->hs_count + serialized_len;
+    if (written != expected) {
+        olog("[!] hs_cache_save(%s): short write (%zu/%zu), removing %s\n",
+             db_label, written, expected, cache_path);
+        unlink(cache_path);
+        return -1;
+    }
+
+    olog("[*] hs_cache_save(%s): cached %u patterns (%zu bytes) to %s\n",
+         db_label, hsdb->hs_count, expected, cache_path);
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ * hs_cache_load
+ * ------------------------------------------------------------------- */
+hs_sigdb_t *hs_cache_load(signature *siglist, const char *cache_path,
+                           const char *sig_file_path, const char *db_label)
+{
+    if (!siglist || !cache_path || !sig_file_path)
+        return NULL;
+
+    FILE *fp = fopen(cache_path, "rb");
+    if (!fp) return NULL;
+
+    /* Read header */
+    hs_cache_header_t hdr;
+    if (fread(&hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) {
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Validate magic */
+    if (memcmp(hdr.magic, HS_CACHE_MAGIC, strlen(HS_CACHE_MAGIC)) != 0) {
+        olog("[*] hs_cache_load(%s): invalid magic in %s\n",
+             db_label, cache_path);
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Check Vectorscan version — serialized DBs are not portable across versions */
+    if (strncmp(hdr.hs_ver, hs_version(), HS_CACHE_VER_SIZE) != 0) {
+        olog("[*] hs_cache_load(%s): hs version mismatch "
+             "(cached: %.*s, current: %s)\n",
+             db_label, HS_CACHE_VER_SIZE, hdr.hs_ver, hs_version());
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Check sig file content hash */
+    uint64_t current_hash = fnv1a_hash_file(sig_file_path);
+    if (current_hash != hdr.sig_hash) {
+        olog("[*] hs_cache_load(%s): sig file changed, cache invalidated\n",
+             db_label);
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Verify sig count still matches */
+    uint32_t sig_count = count_valid_sigs(siglist);
+    if (sig_count != hdr.batch_count) {
+        olog("[*] hs_cache_load(%s): sig count mismatch (%u vs cached %u)\n",
+             db_label, sig_count, hdr.batch_count);
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Read per-sig flags */
+    uint8_t *cached_flags = calloc(hdr.batch_count, sizeof(uint8_t));
+    if (!cached_flags) { fclose(fp); return NULL; }
+    if (fread(cached_flags, 1, hdr.batch_count, fp) != hdr.batch_count) {
+        free(cached_flags);
+        fclose(fp);
+        return NULL;
+    }
+
+    /* Read serialized HS database */
+    char *serialized = malloc(hdr.hsdb_size);
+    if (!serialized) { free(cached_flags); fclose(fp); return NULL; }
+    if (fread(serialized, 1, hdr.hsdb_size, fp) != hdr.hsdb_size) {
+        free(cached_flags);
+        free(serialized);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+
+    /* Deserialize */
+    hs_database_t *db = NULL;
+    hs_error_t ret = hs_deserialize_database(serialized, hdr.hsdb_size, &db);
+    free(serialized);
+    if (ret != HS_SUCCESS) {
+        olog("[!] hs_cache_load(%s): hs_deserialize_database failed (%d)\n",
+             db_label, ret);
+        free(cached_flags);
+        return NULL;
+    }
+
+    /* Build the hs_sigdb_t */
+    hs_sigdb_t *hsdb = calloc(1, sizeof(hs_sigdb_t));
+    if (!hsdb) { hs_free_database(db); free(cached_flags); return NULL; }
+
+    hsdb->db = db;
+    ret = hs_alloc_scratch(hsdb->db, &hsdb->scratch);
+    if (ret != HS_SUCCESS) {
+        olog("[!] hs_cache_load(%s): hs_alloc_scratch failed (%d)\n",
+             db_label, ret);
+        hs_free_database(db);
+        free(hsdb);
+        free(cached_flags);
+        return NULL;
+    }
+
+    hsdb->hs_count  = hdr.batch_count;
+    hsdb->sig_array = calloc(hdr.batch_count, sizeof(signature *));
+    hsdb->sig_flags = calloc(hdr.batch_count, sizeof(uint8_t));
+    if (!hsdb->sig_array || !hsdb->sig_flags) {
+        hs_sigdb_free(hsdb);
+        free(cached_flags);
+        return NULL;
+    }
+
+    /* Count PCRE2-only patterns for pre-allocation */
+    uint32_t pcre2_only_cnt = 0;
+    for (uint32_t j = 0; j < hdr.batch_count; j++) {
+        if (cached_flags[j] & HS_SIG_PCRE2_ONLY)
+            pcre2_only_cnt++;
+    }
+    signature **pcre2_only_arr = NULL;
+    if (pcre2_only_cnt > 0)
+        pcre2_only_arr = calloc(pcre2_only_cnt, sizeof(signature *));
+
+    /* Walk the signature linked list and rebuild mappings */
+    uint32_t idx = 0;
+    uint32_t p2idx = 0;
+    for (signature *sig = siglist; sig != NULL; sig = sig->next) {
+        if (sig->regex_str == NULL || bdata(sig->regex_str) == NULL
+            || sig->regex_str->slen == 0)
+            continue;
+        if (idx >= hdr.batch_count) break;
+
+        uint8_t sf = cached_flags[idx];
+        sig->hs_id    = idx;
+        sig->hs_flags = sf;
+
+        if (sf & HS_SIG_PCRE2_ONLY) {
+            if (pcre2_only_arr && p2idx < pcre2_only_cnt)
+                pcre2_only_arr[p2idx++] = sig;
+            compile_pcre2_for_sig(sig);
+        } else {
+            hsdb->sig_array[idx] = sig;
+            hsdb->sig_flags[idx] = sf;
+            if (sf & (HS_SIG_CAPTURE | HS_SIG_PREFILTER))
+                compile_pcre2_for_sig(sig);
+        }
+        idx++;
+    }
+
+    hsdb->pcre2_only       = pcre2_only_arr;
+    hsdb->pcre2_only_count = p2idx;
+
+    free(cached_flags);
+    olog("[*] hs_cache_load(%s): loaded %u patterns from cache "
+         "(%u PCRE2-only)\n",
+         db_label, hsdb->hs_count, hsdb->pcre2_only_count);
+    return hsdb;
 }

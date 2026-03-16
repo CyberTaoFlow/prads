@@ -349,8 +349,11 @@ bstring get_app_name(signature * sig,
                 int ret = pcre2_substring_get_bynumber(
                               match_data, (uint32_t)n, &expr, &exprlen);
                 if (ret == 0 && expr != NULL) {
-                    for (PCRE2_SIZE x = 0; x < exprlen && z < (int)(sizeof(sub) - 1); x++)
-                        sub[z++] = (char)expr[x];
+                    for (PCRE2_SIZE x = 0; x < exprlen && z < (int)(sizeof(sub) - 1); x++) {
+                        unsigned char c = (unsigned char)expr[x];
+                        if (c >= 0x20 && c != 0x7f)
+                            sub[z++] = (char)c;
+                    }
                     pcre2_substring_free(expr);
                 }
             }

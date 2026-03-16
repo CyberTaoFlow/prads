@@ -1,0 +1,82 @@
+From c1d835bb48d67b6b35db951541ef25aa6e8744b9 Mon Sep 17 00:00:00 2001
+From: Test <test@test.com>
+Date: Thu, 5 Mar 2026 09:41:00 +0000
+Subject: [PATCH] Update Makefile.pfring to use Vectorscan + PCRE2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to the Vectorscan migration patch.  Applies the same
+library substitution to the PF_RING build path:
+
+  - Dynamic linking:  -lpcre  →  -lhs -lpcre2-8 -lstdc++ -lm
+  - Static linking:   libpcre.a  →  libhs.a libpcre2-8.a
+  - FreeBSD linking:  same substitution
+  - OBJECTS:          added hs_engine.o
+  - Makefile pfring echo:  updated dependency list
+
+Without this patch, 'make pfring' would still link against the
+EOL libpcre and fail to resolve Vectorscan/PCRE2 symbols.
+---
+ Makefile            | 4 ++--
+ src/Makefile.pfring | 8 ++++----
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 7e477e8..02a4f55 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,8 +14,8 @@ build:
+ 	@echo "You need libpcre2-dev, libpcap-dev, and libvectorscan-dev (or libhyperscan-dev) to compile this program."
+ 	${MAKE} CONFDIR=${CONFDIR} -C src/
+ pfring:
+-        @echo "You need libpcre-dev, libpcap-dev, librt, libnuma and libpfring to compile this program."
+-        ${MAKE} CONFDIR=${CONFDIR} -f Makefile.pfring -C src/
++	@echo "You need libpcre2-dev, libpcap-dev, librt, libnuma, libvectorscan-dev (or libhyperscan-dev), and libpfring to compile this program."
++	${MAKE} CONFDIR=${CONFDIR} -f Makefile.pfring -C src/
+ 
+ clean:
+ 	${MAKE} -C src/ $@
+diff --git a/src/Makefile.pfring b/src/Makefile.pfring
+index b741733..1e23ccc 100644
+--- a/src/Makefile.pfring
++++ b/src/Makefile.pfring
+@@ -32,7 +32,7 @@ endif
+ ifeq (${TCMALLOC},y)
+ LDFLAGS+=-ltcmalloc
+ endif
+-LDFLAGS+=-lpcap -lpcre -lresolv -lpfring -lrt -lnuma
++LDFLAGS+=-lpcap -lhs -lpcre2-8 -lresolv -lpfring -lrt -lnuma -lstdc++ -lm
+ CFLAGS+=-DCONFDIR='"${CONFDIR}/"'
+ 
+ else
+@@ -48,7 +48,7 @@ endif
+ 
+ CFLAGS+=-DCONFDIR='"prads.d/"' -static
+ LDFLAGS=-static
+-LDFLAGS+=${LIBDIR}/libpcre.a ${PCAPDIR}/libpcap.a ${LIBDIR}/libresolv.a
++LDFLAGS+=${LIBDIR}/libhs.a ${LIBDIR}/libpcre2-8.a ${PCAPDIR}/libpcap.a ${LIBDIR}/libresolv.a -lstdc++ -lm
+ 
+ endif
+ 
+@@ -68,7 +68,7 @@ ifneq (${DEBUG_PACKET},)
+ CFLAGS+= -DDEBUG_PACKET
+ endif
+ ifeq ($(UNAME), FreeBSD)
+-LDFLAGS= -L/usr/local/lib -lpcre -lpcap
++LDFLAGS= -L/usr/local/lib -lhs -lpcre2-8 -lpcap -lstdc++ -lm
+ CPPFLAGS= -I/usr/local/include
+ endif
+ 
+@@ -87,7 +87,7 @@ IPFP_OBJ = ipfp/ipfp.o ipfp/udp_fp.o ipfp/icmp_fp.o
+ LOG_OBJ = output-plugins/log_dispatch.o output-plugins/log_stdout.o output-plugins/log_file.o output-plugins/log_fifo.o output-plugins/log_ringbuffer.o output-plugins/log_sguil.o
+ CXT_OBJ = cxt.o
+ MODULES = dhcp.o dump_dns.o mac.o ${SERVICE_OBJ} ${IPFP_OBJ} ${CXT_OBJ} ${LOG_OBJ}
+-OBJECTS = bstrlib.o sig_tcp.o config.o sys_func.o assets.o prads.o ${MODULES}
++OBJECTS = bstrlib.o sig_tcp.o config.o sys_func.o assets.o hs_engine.o prads.o ${MODULES}
+ SHM_CLIENT_OBJECTS = shm-client.o
+ 
+ all: prads shm-client
+-- 
+2.43.0
+

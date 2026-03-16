@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""prads2snort — Generate IDS host attribute configurations from PRADS logs.
+
+Output formats:
+  snort     Snort host_attribute.xml (frag3/stream5 policies, services)
+  suricata  Suricata YAML fragments (host-os-policy, defrag, libhtp personalities)
+  json      ECS-compliant JSON for Elastic/SIEM ingestion
+  all       Generate all formats
+
+Improvements over the original:
+- OS inference from service banners and client fingerprints
+- OS transition detection
+- CPE and User-Agent parsing for enriched host profiles
+- Client attribute support (uncommented and functional)
+- Suricata configuration generation (host-os-policy, defrag, libhtp)
+- ECS JSON output
+"""
+
+import argparse
+import json
+import os
+import sys
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom.minidom import parseString
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prads_utils import (
+    parse_log_file, guess_os, get_latest_services, get_deduplicated_clients,
+    get_snort_policy, get_server_and_version, get_suricata_os_policy,
+    build_suricata_config, format_suricata_yaml,
+    host_to_ecs, format_timestamp, ip_sort_key,
+)
+
+__version__ = '2.0'
+__date__ = '2026-03-13'
+
+
+# ── Snort XML output ───────────────────────────────────────────────────────
+
+def _xml_attr_val(parent, tag, value, confidence=None):
+    """Helper to create <TAG><ATTRIBUTE_VALUE>val</..><CONFIDENCE>n</..></TAG>."""
+    el = SubElement(parent, tag)
+    av = SubElement(el, 'ATTRIBUTE_VALUE')
+    av.text = str(value)
+    if confidence is not None:
+        cf = SubElement(el, 'CONFIDENCE')
+        cf.text = str(confidence)
+    return el
+
+
+def generate_snort_xml(hosts, os_results, args):
+    """Generate Snort host_attribute.xml content."""
+    root = Element('SNORT_ATTRIBUTES')
+
+    attr_map = SubElement(root, 'ATTRIBUTE_MAP')
+    entry = SubElement(attr_map, 'ENTRY')
+    id_el = SubElement(entry, 'ID')
+    id_el.text = '31337'
+    val_el = SubElement(entry, 'VALUE')
+    val_el.text = 'prads2snort v' + __version__
+
+    attr_table = SubElement(root, 'ATTRIBUTE_TABLE')
+
+    stats_os = {}
+    stats_svc = {}
+    known = 0
+    unknown = 0
+    total_conf = 0
+
+    for ip in sorted(hosts, key=ip_sort_key):
+        host = hosts[ip]
+        oi = os_results[ip]
+
+        os_name = oi['os']
+        os_det = oi['details']
+        conf = oi['confidence']
+
+        stats_os[os_name] = stats_os.get(os_name, {'count': 0, 'conf': 0})
+        stats_os[os_name]['count'] += 1
+        stats_os[os_name]['conf'] += conf
+
+        if conf < args.skip:
+            if args.verbose:
+                sys.stderr.write(f'{ip} OS:{os_name} — skipping, confidence:{conf}\n')
+            continue
+
+        if os_name == 'unknown':
+            unknown += 1
+        else:
+            known += 1
+            total_conf += conf
+
+        frag3, stream5 = get_snort_policy(os_name, os_det, args.default_os)
+
+        if args.verbose:
+            sys.stderr.write(f'{ip} OS:{os_name} — frag3={frag3},'
+                             f' stream5={stream5}, confidence:{conf}\n')
+
+        # Build HOST element
+        host_el = SubElement(attr_table, 'HOST')
+
+        ip_el = SubElement(host_el, 'IP')
+        ip_el.text = ip
+
+        os_el = SubElement(host_el, 'OPERATING_SYSTEM')
+        _xml_attr_val(os_el, 'NAME', os_name, conf)
+        _xml_attr_val(os_el, 'VENDOR', os_name, conf)
+        _xml_attr_val(os_el, 'VERSION', os_det, conf)
+
+        frag_el = SubElement(os_el, 'FRAG_POLICY')
+        frag_el.text = frag3
+        stream_el = SubElement(os_el, 'STREAM_POLICY')
+        stream_el.text = stream5
+
+        # Services
+        cutoff = (oi['timestamp'] or 0) - 43200
+        services = get_latest_services(host, cutoff)
+
+        has_services = services['tcp'] or services['udp']
+        if has_services:
+            svcs_el = SubElement(host_el, 'SERVICES')
+            _add_service_elements(svcs_el, services['tcp'], 'tcp', stats_svc)
+            _add_service_elements(svcs_el, services['udp'], 'udp', stats_svc)
+
+        # Clients
+        clients = get_deduplicated_clients(host, cutoff)
+        non_trivial_clients = [(p, pt, s, d, t) for p, pt, s, d, t in clients
+                               if s != 'unknown' and not d.startswith('@')]
+        if non_trivial_clients:
+            cli_el = SubElement(host_el, 'CLIENTS')
+            for proto, port, svc, det, ts in non_trivial_clients:
+                client_el = SubElement(cli_el, 'CLIENT')
+                _xml_attr_val(client_el, 'PROTOCOL', svc)
+                app_el = SubElement(client_el, 'APPLICATION')
+                av = SubElement(app_el, 'ATTRIBUTE_VALUE')
+                av.text = det[:100] if len(det) > 100 else det
+                ver_el = SubElement(app_el, 'VERSION')
+                vav = SubElement(ver_el, 'ATTRIBUTE_VALUE')
+                vav.text = ''
+
+    # Pretty-print XML
+    raw = tostring(root, encoding='unicode')
+    dom = parseString(raw)
+    return dom.toprettyxml(indent='  ', encoding=None)
+
+
+def _add_service_elements(parent, port_map, proto, stats_svc):
+    """Add SERVICE elements to an XML parent."""
+    confidence = 90
+    for port in sorted(port_map):
+        svc_name, det, ts = port_map[port]
+        if svc_name == 'unknown' and det.startswith('@'):
+            continue
+
+        serv, vers = get_server_and_version(det)
+        stats_svc[serv] = stats_svc.get(serv, 0) + 1
+
+        svc_el = SubElement(parent, 'SERVICE')
+        _xml_attr_val(svc_el, 'PORT', str(port), confidence)
+        _xml_attr_val(svc_el, 'IPPROTO', proto, confidence)
+        _xml_attr_val(svc_el, 'PROTOCOL', svc_name, confidence)
+
+        app_el = SubElement(svc_el, 'APPLICATION')
+        av = SubElement(app_el, 'ATTRIBUTE_VALUE')
+        av.text = serv
+        ver_el = SubElement(app_el, 'VERSION')
+        vav = SubElement(ver_el, 'ATTRIBUTE_VALUE')
+        vav.text = vers
+        vcf = SubElement(ver_el, 'CONFIDENCE')
+        vcf.text = str(confidence)
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='PRADS to IDS Configuration Generator v' + __version__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''Output formats:
+  snort      Snort host_attribute.xml (default)
+  suricata   Suricata YAML config fragments
+  json       ECS-compliant JSON
+  all        Generate all formats (uses -o as base name)
+
+Examples:
+  %(prog)s -i prads-asset.log -f snort -o host_attribute.xml
+  %(prog)s -i prads-asset.log -f suricata -o suricata-prads.yaml
+  %(prog)s -i prads-asset.log -f json -o assets.json
+  %(prog)s -i prads-asset.log -f all -o prads-output
+''')
+
+    parser.add_argument('-i', '--infile',
+                        default='/var/log/prads-asset.log',
+                        help='PRADS asset log file')
+    parser.add_argument('-o', '--outfile',
+                        default='hosts_attribute.xml',
+                        help='Output file (or base name for --format all)')
+    parser.add_argument('-d', '--default-os', default='linux',
+                        choices=['linux', 'bsd', 'windows', 'macos'],
+                        help='Default OS for unknown hosts (default: linux)')
+    parser.add_argument('-s', '--skip', type=int, default=0,
+                        help='Skip hosts with OS confidence below this %%')
+    parser.add_argument('-f', '--format',
+                        choices=['snort', 'suricata', 'json', 'all'],
+                        default='snort', help='Output format (default: snort)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Print per-host details to stderr')
+    parser.add_argument('--force', action='store_true',
+                        help='Overwrite existing output files')
+    parser.add_argument('--filter-ip', help='Process only this IP address')
+    parser.add_argument('--version', action='version',
+                        version=f'prads2snort {__version__} ({__date__})')
+
+    args = parser.parse_args()
+
+    sys.stderr.write(f'[*] prads2snort v{__version__}\n')
+    sys.stderr.write(f'[*] Reading: {args.infile}\n')
+
+    # Parse log
+    hosts = parse_log_file(args.infile, filter_ip=args.filter_ip)
+    sys.stderr.write(f'[*] Found {len(hosts)} unique hosts\n')
+
+    if not hosts:
+        sys.stderr.write('[*] No assets found.\n')
+        return 1
+
+    # Compute OS for all hosts
+    os_results = {}
+    for ip, host in hosts.items():
+        os_results[ip] = guess_os(host)
+
+    # Determine output files
+    fmt = args.format
+    outputs = {}
+
+    if fmt in ('snort', 'all'):
+        fn = args.outfile if fmt == 'snort' else args.outfile + '.xml'
+        outputs['snort'] = fn
+    if fmt in ('suricata', 'all'):
+        fn = args.outfile if fmt == 'suricata' else args.outfile + '-suricata.yaml'
+        outputs['suricata'] = fn
+    if fmt in ('json', 'all'):
+        fn = args.outfile if fmt == 'json' else args.outfile + '.json'
+        outputs['json'] = fn
+
+    # Check existing files
+    if not args.force:
+        for name, fn in outputs.items():
+            if os.path.exists(fn):
+                sys.stderr.write(f'[!] File exists: {fn}  (use --force to overwrite)\n')
+                return 1
+
+    # ── Generate Snort XML ──
+    if 'snort' in outputs:
+        sys.stderr.write(f'[*] Generating Snort XML: {outputs["snort"]}\n')
+        xml_str = generate_snort_xml(hosts, os_results, args)
+        with open(outputs['snort'], 'w') as f:
+            f.write(xml_str)
+
+    # ── Generate Suricata YAML ──
+    if 'suricata' in outputs:
+        sys.stderr.write(f'[*] Generating Suricata YAML: {outputs["suricata"]}\n')
+        suri_config = build_suricata_config(hosts, os_results)
+        yaml_str = format_suricata_yaml(suri_config)
+        with open(outputs['suricata'], 'w') as f:
+            f.write(yaml_str)
+
+    # ── Generate ECS JSON ──
+    if 'json' in outputs:
+        sys.stderr.write(f'[*] Generating ECS JSON: {outputs["json"]}\n')
+        results = []
+        for ip in sorted(hosts, key=ip_sort_key):
+            host = hosts[ip]
+            oi = os_results[ip]
+            cutoff = (oi['timestamp'] or 0) - 43200
+            services = get_latest_services(host, cutoff)
+            clients  = get_deduplicated_clients(host, cutoff)
+            results.append(host_to_ecs(host, oi, services, clients))
+
+        with open(outputs['json'], 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+            f.write('\n')
+
+    # ── Summary ──
+    os_counts = {}
+    conf_total = 0
+    known = 0
+    for ip, oi in os_results.items():
+        os_name = oi['os']
+        os_counts[os_name] = os_counts.get(os_name, 0) + 1
+        if os_name != 'unknown' and oi['confidence'] >= args.skip:
+            known += 1
+            conf_total += oi['confidence']
+
+    transitions = sum(len(oi.get('transitions', [])) for oi in os_results.values())
+
+    sys.stderr.write(f'[*] Processed {len(hosts)} hosts\n')
+    sys.stderr.write(f'[*] Known OS: {known}\n')
+    for os_name in sorted(os_counts, key=os_counts.get, reverse=True):
+        sys.stderr.write(f'    {os_name}: {os_counts[os_name]}\n')
+    if known > 0:
+        sys.stderr.write(f'[*] Average OS confidence: {conf_total // known}%\n')
+    if transitions:
+        sys.stderr.write(f'[*] OS transitions detected: {transitions}\n')
+    sys.stderr.write('[*] Done.\n')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)
