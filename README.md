@@ -10,7 +10,9 @@
 Passive Real-time Asset Detection system!
 ```
 
-## Baut' ##
+> **Fork notice:** This is a fork of [gamelinux/prads](https://github.com/gamelinux/prads) with significant engine and tooling improvements. See [What's New in This Fork](#whats-new-in-this-fork) below.
+
+## About ##
 
 PRADS stands for `Passive Real-time Asset Detection System`. PRADS passively
 listens to network traffic and gathers information about hosts and services
@@ -19,13 +21,54 @@ without performing an active scan (no packets are ever sent), allowing you to
 enumerate active hosts and services. It can also be used together with your
 favorite IDS/IPS setup for "event to application" correlation.
 
+## What's New in This Fork ##
+
+### Vectorscan/Hyperscan + PCRE2 Engine (v0.4.0)
+
+The original PCRE-based service fingerprinting engine has been replaced with a
+Vectorscan (Hyperscan) + PCRE2 hybrid:
+
+- All service signatures are compiled into a single Vectorscan multi-pattern DFA
+  per category (TCP server, TCP client, UDP server, UDP client) for fast matching
+- Signatures requiring capture groups or incompatible with Vectorscan fall back
+  to PCRE2 automatically
+- Compiled Vectorscan databases are cached to disk and reloaded on startup,
+  avoiding recompilation when signatures haven't changed
+
+### Build Improvements
+
+- PF_RING support is now guarded behind a `HAVE_PFRING` preprocessor flag,
+  allowing clean builds without PF_RING installed
+- CMake build support added alongside the existing Makefile
+
+### Python Analysis Tools
+
+Three new tools in `tools/` for working with prads-asset.log output (stdlib only, no pip dependencies):
+
+- **prads-asset-report2** -- Asset report generator with text, ECS JSON, and dict JSON output. Includes an OS inference engine combining TCP fingerprint voting with service banner and User-Agent analysis.
+- **prads2snort2** -- IDS host attribute generator for Snort XML, Suricata YAML (host-os-policy, defrag, libhtp personalities), and ECS JSON.
+- **prads_utils.py** -- Shared library for log parsing, OS inference, policy mapping, and ECS serialization.
+- **nmap2prads** -- Signature converter for generating PRADS passive service signatures from nmap-service-probes with Vectorscan/PCRE2 optimization.
+
+See [tools/README.md](tools/README.md) for full documentation and examples.
+
+### Patches
+
+The `patches/` directory contains the Vectorscan + PCRE2 migration patches for
+reference only. The code in this fork already has these changes applied -- you
+do **not** need to apply the patches.
+
+## Disclaimer ##
+
+This was developed as part of an autodidactic journey taken with Anthropic's excellent Claude (code) prompted to instruct me.
+
 ## As is! ##
 
 This program is provided 'as is'. We take no responsibility for anything :)
 
-## Lic ##
+## License ##
 
-GPL v2 or better? See LICENSE
+GPL v2 or later. See [LICENSE](LICENSE).
 
 ## Install ##
 
