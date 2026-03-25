@@ -534,6 +534,10 @@ typedef struct _connection {
     uint8_t  check;               /* Flags spesifying checking */
     struct   _asset *c_asset;     /* pointer to src asset */
     struct   _asset *s_asset;     /* pointer to server asset */
+#ifdef HAVE_NDPI
+    void    *ndpi_flow;           /* opaque ndpi_flow_struct*, NULL until first pkt */
+    uint16_t ndpi_flags;          /* nDPI state tracking flags */
+#endif
 } connection;
 #define CXT_DONT_CHECK_SERVER     0x01  /* Dont check server packets */
 #define CXT_DONT_CHECK_CLIENT     0x02  /* Dont check client packets */

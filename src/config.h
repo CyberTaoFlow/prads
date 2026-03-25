@@ -106,6 +106,10 @@ typedef struct _globalconfig {
     dhcp_fp_entry **sig_dhcp;           /* DHCP signature hash */
     char        *bpf_file;              /* filename of BPF file to load */
     uint8_t      tcpopt_parsable;
+#ifdef HAVE_NDPI
+    void        *ndpi_module;          /* ndpi_detection_module_struct* */
+    void        *ndpi_gctx;            /* ndpi_global_context* */
+#endif
 
 } globalconfig;
 #define ISSET_CONFIG_VERBOSE(config)    ((config).cflags & CONFIG_VERBOSE)

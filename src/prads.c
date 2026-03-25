@@ -47,6 +47,7 @@
 #ifdef HAVE_PFRING
 #include <pfring.h>
 #endif
+#include "ndpi_engine.h"
 //#include "output-plugins/log_init.h"
 #include "output-plugins/log.h"
 
@@ -687,6 +688,12 @@ void parse_tcp (packetinfo *pi)
 {
     update_asset(pi);
 
+#ifdef HAVE_NDPI
+    if (config.ndpi_module != NULL && pi->cxt != NULL && pi->plen > 0
+        && !(pi->cxt->ndpi_flags & (NDPI_FL_DONE | NDPI_FL_GIVEUP)))
+        ndpi_engine_process_packet(&config, pi);
+#endif
+
     if (TCP_ISFLAGSET(pi->tcph, (TF_SYN))) {
         if (!TCP_ISFLAGSET(pi->tcph, (TF_ACK))) {
             if (IS_COSET(&config,CO_SYN)) {
@@ -782,6 +789,13 @@ void prepare_udp (packetinfo *pi)
 void parse_udp (packetinfo *pi)
 {
     update_asset(pi);
+
+#ifdef HAVE_NDPI
+    if (config.ndpi_module != NULL && pi->cxt != NULL && pi->plen > 0
+        && !(pi->cxt->ndpi_flags & (NDPI_FL_DONE | NDPI_FL_GIVEUP)))
+        ndpi_engine_process_packet(&config, pi);
+#endif
+
     //if (is_set_guess_upd_direction(config)) {
     udp_guess_direction(pi); // fix DNS server transfers?
     // Check for Passive DNS
@@ -1060,6 +1074,9 @@ void game_over()
         end_sessions(); /* Need to have correct human output when reading -r pcap */
         clear_asset_list();
         end_all_sessions();
+#ifdef HAVE_NDPI
+        ndpi_engine_destroy(&config);
+#endif
         del_known_services();
         /* Free Vectorscan databases before the signature lists they reference */
         hs_sigdb_free(config.hs_serv_tcp);
@@ -1516,6 +1533,11 @@ int main(int argc, char *argv[])
 #undef HS_COMPILE_OR_CACHE
 
     init_services();
+
+#ifdef HAVE_NDPI
+    if (ndpi_engine_init(&config) != 0)
+        elog("[!] nDPI init failed - continuing without DPI\n");
+#endif
 
     display_config(&config);
 

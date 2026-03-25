@@ -5,6 +5,7 @@
 #include "sys_func.h"
 #include "config.h"
 #include "output-plugins/log.h"
+#include "ndpi_engine.h"
 
 extern globalconfig config;
 
@@ -341,11 +342,13 @@ void del_connection(connection * cxt, connection ** bucket_ptr)
         next->prev = prev;
     }
 
-    /*
-     * Free and set to NULL 
-     */
+    /* Free the connection.  Note: cxt is a local copy of the caller's
+     * pointer, so setting it to NULL here would only affect the local
+     * copy -- the caller is responsible for not reusing its pointer. */
+#ifdef HAVE_NDPI
+    ndpi_engine_free_flow(cxt);
+#endif
     free(cxt);
-    cxt = NULL;
 }
 
 void end_all_sessions()
