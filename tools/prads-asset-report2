@@ -262,7 +262,8 @@ def main():
                         help='PRADS asset log file (default: /var/log/prads-asset.log)')
     parser.add_argument('-w', '--output-file',
                         help='Write output to file instead of stdout')
-    parser.add_argument('-i', '--ip', help='Report only this IP address')
+    parser.add_argument('-i', '--ip',
+                        help='Filter by IP address or CIDR network (e.g. 10.15.1.27 or 10.15.1.0/24)')
     parser.add_argument('-n', '--no-dns', action='store_true',
                         help='Do not resolve IP addresses to names')
     parser.add_argument('-p', '--private-only', action='store_true',

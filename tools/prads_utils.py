@@ -12,6 +12,7 @@ Provides:
 - ECS (Elastic Common Schema) JSON serialization
 """
 
+import ipaddress
 import os
 import re
 import socket
@@ -514,8 +515,19 @@ _LINE_RE = re.compile(
 
 
 def parse_log_file(filepath, filter_ip=None):
-    """Parse a PRADS asset log file and return {ip: HostAsset}."""
+    """Parse a PRADS asset log file and return {ip: HostAsset}.
+
+    filter_ip can be a single IP address or a CIDR network (e.g. '10.15.1.0/24').
+    """
     hosts = {}
+
+    # Build the IP filter: exact match for single IP, network containment for CIDR
+    ip_filter = None
+    if filter_ip:
+        if '/' in filter_ip:
+            ip_filter = ipaddress.ip_network(filter_ip, strict=False)
+        else:
+            ip_filter = filter_ip
 
     with open(filepath, 'r', errors='replace') as fh:
         for line in fh:
@@ -536,8 +548,13 @@ def parse_log_file(filepath, filter_ip=None):
             dist  = int(m.group(7))
             ts    = int(m.group(8))
 
-            if filter_ip and ip != filter_ip:
-                continue
+            if ip_filter:
+                if isinstance(ip_filter, str):
+                    if ip != ip_filter:
+                        continue
+                else:
+                    if ipaddress.ip_address(ip) not in ip_filter:
+                        continue
 
             if ip not in hosts:
                 hosts[ip] = HostAsset(ip)

@@ -38,12 +38,12 @@ Human-readable asset inventory reports with OS inference, deduplication, and str
 ### Usage
 
 ```
-prads-asset-report2 [-r FILE] [-w FILE] [-i IP] [-n] [-p] [-f FORMAT]
+prads-asset-report2 [-r FILE] [-w FILE] [-i IP|CIDR] [-n] [-p] [-f FORMAT]
 
 Options:
   -r, --report-file FILE   PRADS asset log (default: /var/log/prads-asset.log)
   -w, --output-file FILE   Write output to file instead of stdout
-  -i, --ip IP              Report only this IP address
+  -i, --ip IP|CIDR         Filter by IP address or CIDR network (e.g. 10.15.1.27 or 10.15.1.0/24)
   -n, --no-dns             Skip reverse DNS lookups
   -p, --private-only       Only resolve RFC 1918 addresses
   -f, --format FORMAT      text (default), json (ECS), or dict
@@ -59,6 +59,11 @@ python3 tools/prads-asset-report2 -r logs/prads-asset.log -n -f text
 **Investigate a single host:**
 ```bash
 python3 tools/prads-asset-report2 -r logs/prads-asset.log -n -i 10.15.1.27
+```
+
+**Report on a subnet:**
+```bash
+python3 tools/prads-asset-report2 -r logs/prads-asset.log -n -i 10.15.1.0/24
 ```
 
 **Export ECS JSON for Elasticsearch:**
@@ -531,7 +536,7 @@ python3 tools/prads-asset-report2 -r prads-asset.log -n -f json -w /tmp/assets.j
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `parse_log_file(path, filter_ip)` | `{ip: HostAsset}` | Parse entire log file |
+| `parse_log_file(path, filter_ip)` | `{ip: HostAsset}` | Parse entire log file; filter_ip accepts IP or CIDR |
 | `guess_os(host, lookback_hours)` | dict | OS guess with confidence and transitions |
 | `get_latest_services(host, cutoff)` | dict | Deduplicated services per port |
 | `get_deduplicated_clients(host, cutoff)` | list | Normalized unique client entries |
@@ -555,7 +560,7 @@ import sys
 sys.path.insert(0, 'tools')
 from prads_utils import parse_log_file, guess_os, get_latest_services
 
-hosts = parse_log_file('logs/prads-asset.log', filter_ip='10.15.1.27')
+hosts = parse_log_file('logs/prads-asset.log', filter_ip='10.15.1.0/24')
 for ip, host in hosts.items():
     os_info = guess_os(host)
     services = get_latest_services(host)
