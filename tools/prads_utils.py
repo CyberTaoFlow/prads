@@ -221,6 +221,23 @@ def infer_os_from_service(service_name, info):
     if 'Mac OS X' in info:
         hints.append(('MacOS', 'Mac OS X', 7))
 
+    # nDPI bracket metadata: SSH server version, HTTP Server header
+    ndpi = parse_ndpi_metadata(info)
+    if ndpi.get('ssh_server'):
+        sv = ndpi['ssh_server']
+        if 'OpenSSH' in sv:
+            hints.append(('Linux', f'Linux/Unix ({sv})', 3))
+        elif 'Windows' in sv or 'Microsoft' in sv:
+            hints.append(('Windows', f'Windows ({sv})', 4))
+    if ndpi.get('http_server'):
+        srv = ndpi['http_server']
+        if re.search(r'\bnginx\b', srv, re.I):
+            hints.append(('Linux', f'Linux ({srv})', 2))
+        elif 'Apache' in srv and 'Win' not in srv:
+            hints.append(('Linux', f'Linux ({srv})', 2))
+        elif 'IIS' in srv or 'Microsoft' in srv:
+            hints.append(('Windows', f'Windows ({srv})', 5))
+
     return hints
 
 
@@ -350,6 +367,17 @@ def infer_os_from_client(service_name, details):
     if 'OpenSSH' in details and 'keyscan' not in details:
         hints.append(('Linux', 'Linux/Unix (OpenSSH client)', 2))
 
+    # nDPI bracket metadata: SSH client version, Kerberos domain
+    ndpi = parse_ndpi_metadata(details)
+    if ndpi.get('ssh_client'):
+        cv = ndpi['ssh_client']
+        if 'PuTTY' in cv:
+            hints.append(('Windows', f'Windows ({cv})', 4))
+        elif 'OpenSSH' in cv:
+            hints.append(('Linux', f'Linux/Unix ({cv})', 3))
+    if ndpi.get('krb_domain'):
+        hints.append(('Windows', f'Windows AD ({ndpi["krb_domain"]})', 4))
+
     return hints
 
 
@@ -457,6 +485,97 @@ def parse_service_info(info):
     if m:
         return m.group(1), m.group(2)
     return 'unknown', info
+
+
+# Regex for nDPI combined metadata fields produced by ndpi_engine_surface_result.
+# Format: "ProtoName (hostname) [TLSv1.3] [JA4:hash] [cert:CN/Issuer] {RISK:...}"
+_NDPI_HOSTNAME_RE = re.compile(r'\(([^)]+)\)')
+_NDPI_KV_RE       = re.compile(r'\[([A-Za-z][A-Za-z0-9_-]*):([^\]]+)\]')
+_NDPI_FLAG_RE     = re.compile(r'\[([A-Z][A-Z0-9-]+)\]')       # [WEAK-CIPHER] etc.
+_NDPI_RISK_RE     = re.compile(r'\{RISK:([^}]+)\}')
+
+
+def parse_ndpi_metadata(details):
+    """Extract structured metadata from an nDPI combined service string.
+
+    Returns a dict with keys present only when the metadata exists:
+        hostname     - TLS SNI / HTTP Host
+        tls_version  - e.g. "TLSv1.3"
+        ja4          - JA4 client fingerprint
+        ja3s         - JA3 server fingerprint
+        alpn         - negotiated ALPN (h2, http/1.1)
+        cert_cn      - certificate CN/SAN
+        cert_issuer  - certificate issuer DN
+        cipher_warning - "WEAK-CIPHER" or "INSECURE-CIPHER"
+        ssh_client   - SSH client version string
+        ssh_server   - SSH server version string
+        hassh_client - HASSH client fingerprint
+        hassh_server - HASSH server fingerprint
+        http_server  - HTTP Server header
+        user_agent   - HTTP User-Agent
+        krb_domain   - Kerberos domain
+        krb_host     - Kerberos hostname
+        krb_user     - Kerberos username
+        risks        - list of nDPI risk strings
+    """
+    meta = {}
+
+    # Hostname in parentheses — but skip CPE/OS tags like "(os:Windows cpe:...)"
+    hm = _NDPI_HOSTNAME_RE.search(details)
+    if hm and not hm.group(1).startswith('os:'):
+        meta['hostname'] = hm.group(1)
+
+    # Bracket key:value fields
+    kv_map = {
+        'JA4':    'ja4',
+        'JA3s':   'ja3s',
+        'ALPN':   'alpn',
+        'cert':   '_cert_raw',
+        'client': 'ssh_client',
+        'server': 'ssh_server',
+        'Server': 'http_server',
+        'HASSH-c': 'hassh_client',
+        'HASSH-s': 'hassh_server',
+        'UA':     'user_agent',
+        'domain': 'krb_domain',
+        'host':   'krb_host',
+        'user':   'krb_user',
+    }
+    for m in _NDPI_KV_RE.finditer(details):
+        key, val = m.group(1), m.group(2)
+        if key in kv_map:
+            meta[kv_map[key]] = val
+        # TLS version is a bare value like [TLSv1.3] matched by KV if it
+        # looks like "TLSv1.3" without a colon — handled by flag regex below
+
+    # Bare flags: [WEAK-CIPHER], [INSECURE-CIPHER], [TLSv1.3], etc.
+    for m in _NDPI_FLAG_RE.finditer(details):
+        flag = m.group(1)
+        if flag in ('WEAK-CIPHER', 'INSECURE-CIPHER'):
+            meta['cipher_warning'] = flag
+        elif flag.startswith('TLS') or flag.startswith('DTLS') or flag.startswith('SSL'):
+            meta['tls_version'] = flag
+
+    # Also catch TLS version from key:value style if nDPI formats it that way
+    # The C code uses ndpi_ssl_version2str which produces e.g. "TLSv1.3"
+    tls_m = re.search(r'\[(TLS[v\d.]+|DTLSv[\d.]+|SSLv[\d.]+)\]', details)
+    if tls_m:
+        meta['tls_version'] = tls_m.group(1)
+
+    # Certificate: split "CN/Issuer" format
+    if '_cert_raw' in meta:
+        cert = meta.pop('_cert_raw')
+        parts = cert.split('/', 1)
+        meta['cert_cn'] = parts[0]
+        if len(parts) > 1:
+            meta['cert_issuer'] = parts[1]
+
+    # Risk flags
+    rm = _NDPI_RISK_RE.search(details)
+    if rm:
+        meta['risks'] = [r.strip() for r in rm.group(1).split(',')]
+
+    return meta
 
 
 # ── Data model ──────────────────────────────────────────────────────────────
@@ -1118,6 +1237,68 @@ def _ecs_os_family(os_family):
     return mapping.get(os_family, 'unknown')
 
 
+def _enrich_service_entry(entry, ndpi):
+    """Add structured nDPI sub-objects to a service entry dict."""
+    if ndpi.get('hostname'):
+        entry['hostname'] = ndpi['hostname']
+
+    # TLS sub-object
+    tls = {}
+    if ndpi.get('tls_version'):
+        tls['version'] = ndpi['tls_version']
+    if ndpi.get('ja4'):
+        tls['ja4'] = ndpi['ja4']
+    if ndpi.get('ja3s'):
+        tls['ja3_server'] = ndpi['ja3s']
+    if ndpi.get('alpn'):
+        tls['alpn'] = ndpi['alpn']
+    if ndpi.get('cert_cn'):
+        tls['certificate_subject'] = ndpi['cert_cn']
+    if ndpi.get('cert_issuer'):
+        tls['certificate_issuer'] = ndpi['cert_issuer']
+    if ndpi.get('cipher_warning'):
+        tls['cipher_warning'] = ndpi['cipher_warning']
+    if tls:
+        entry['tls'] = tls
+
+    # SSH sub-object
+    ssh = {}
+    if ndpi.get('ssh_client'):
+        ssh['client_version'] = ndpi['ssh_client']
+    if ndpi.get('ssh_server'):
+        ssh['server_version'] = ndpi['ssh_server']
+    if ndpi.get('hassh_client'):
+        ssh['hassh_client'] = ndpi['hassh_client']
+    if ndpi.get('hassh_server'):
+        ssh['hassh_server'] = ndpi['hassh_server']
+    if ssh:
+        entry['ssh'] = ssh
+
+    # HTTP sub-object
+    http = {}
+    if ndpi.get('http_server'):
+        http['server'] = ndpi['http_server']
+    if ndpi.get('user_agent'):
+        http['user_agent'] = ndpi['user_agent']
+    if http:
+        entry['http'] = http
+
+    # Kerberos sub-object
+    krb = {}
+    if ndpi.get('krb_domain'):
+        krb['domain'] = ndpi['krb_domain']
+    if ndpi.get('krb_host'):
+        krb['hostname'] = ndpi['krb_host']
+    if ndpi.get('krb_user'):
+        krb['username'] = ndpi['krb_user']
+    if krb:
+        entry['kerberos'] = krb
+
+    # Risk flags
+    if ndpi.get('risks'):
+        entry['risks'] = ndpi['risks']
+
+
 def host_to_ecs(host, os_info=None, services=None, clients=None):
     """
     Serialize a HostAsset to Elastic Common Schema (ECS) format.
@@ -1195,17 +1376,25 @@ def host_to_ecs(host, os_info=None, services=None, clients=None):
         cpes = parse_cpe(det)
         if cpes:
             entry['cpe'] = [c['raw'] for c in cpes]
+        # Extract structured nDPI metadata
+        ndpi = parse_ndpi_metadata(det)
+        if ndpi:
+            _enrich_service_entry(entry, ndpi)
         svc_list.append(entry)
 
     for port in sorted(services['udp']):
         svc_name, det, ts = services['udp'][port]
-        svc_list.append({
+        entry = {
             'type': svc_name,
             'port': port,
             'transport': 'udp',
             'description': det,
             'observed_at': format_iso8601(ts),
-        })
+        }
+        ndpi = parse_ndpi_metadata(det)
+        if ndpi:
+            _enrich_service_entry(entry, ndpi)
+        svc_list.append(entry)
     if svc_list:
         doc['service'] = svc_list
 

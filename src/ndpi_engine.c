@@ -14,7 +14,50 @@ extern globalconfig config;
 
 #define NDPI_MAX_PKT_CHECK 20
 
-/* ---- internal helper --------------------------------------------------- */
+/* ---- internal helpers -------------------------------------------------- */
+
+/* Append nDPI risk flags as a comma-separated list.
+ * Only security-relevant risks are surfaced (informational ones skipped). */
+static void append_risk_flags(bstring appl, ndpi_risk risk)
+{
+    if (risk == 0)
+        return;
+
+    static const ndpi_risk_enum security_risks[] = {
+        NDPI_TLS_SELFSIGNED_CERTIFICATE,
+        NDPI_TLS_OBSOLETE_VERSION,
+        NDPI_TLS_WEAK_CIPHER,
+        NDPI_TLS_CERTIFICATE_EXPIRED,
+        NDPI_TLS_CERTIFICATE_MISMATCH,
+        NDPI_TLS_MISSING_SNI,
+        NDPI_TLS_FATAL_ALERT,
+        NDPI_TLS_CERTIFICATE_ABOUT_TO_EXPIRE,
+        NDPI_SSH_OBSOLETE_CLIENT_VERSION_OR_CIPHER,
+        NDPI_SSH_OBSOLETE_SERVER_VERSION_OR_CIPHER,
+        NDPI_CLEAR_TEXT_CREDENTIALS,
+        NDPI_KNOWN_PROTOCOL_ON_NON_STANDARD_PORT,
+        NDPI_SUSPICIOUS_DGA_DOMAIN,
+        NDPI_MALICIOUS_FINGERPRINT,
+        NDPI_MALICIOUS_SHA1_CERTIFICATE,
+        NDPI_MALWARE_HOST_CONTACTED,
+        NDPI_POSSIBLE_EXPLOIT,
+        NDPI_OBFUSCATED_TRAFFIC,
+    };
+
+    int first = 1;
+    for (size_t i = 0; i < sizeof(security_risks)/sizeof(security_risks[0]); i++) {
+        if (risk & (1ULL << security_risks[i])) {
+            if (first) {
+                bformata(appl, " {RISK:%s", ndpi_risk2str(security_risks[i]));
+                first = 0;
+            } else {
+                bformata(appl, ",%s", ndpi_risk2str(security_risks[i]));
+            }
+        }
+    }
+    if (!first)
+        bformata(appl, "}");
+}
 
 static void ndpi_engine_surface_result(struct _globalconfig *conf,
                                        packetinfo *pi,
@@ -23,7 +66,6 @@ static void ndpi_engine_surface_result(struct _globalconfig *conf,
 {
     struct ndpi_detection_module_struct *mod =
         (struct ndpi_detection_module_struct *)conf->ndpi_module;
-    connection *cxt = pi->cxt;
 
     u_int16_t master = result.proto.master_protocol;
     u_int16_t app    = result.proto.app_protocol;
@@ -31,48 +73,131 @@ static void ndpi_engine_surface_result(struct _globalconfig *conf,
     if (master == NDPI_PROTOCOL_UNKNOWN && app == NDPI_PROTOCOL_UNKNOWN)
         return;
 
-    /* Protocol name — once, only if Vectorscan didn't already match */
-    if (!(cxt->ndpi_flags & NDPI_FL_HAS_PROTO)
-        && !(cxt->check & CXT_SERVICE_DONT_CHECK)) {
-        u_int16_t proto_id = (app != NDPI_PROTOCOL_UNKNOWN) ? app : master;
-        char *name = ndpi_get_proto_name(mod, proto_id);
-        if (name && name[0]) {
-            bstring svc = bfromcstr(name);
-            bstring appl = bfromcstr(name);
-            update_asset_service(pi, svc, appl);
-            cxt->ndpi_flags |= NDPI_FL_HAS_PROTO;
+    u_int16_t proto_id = (app != NDPI_PROTOCOL_UNKNOWN) ? app : master;
+    char *name = ndpi_get_proto_name(mod, proto_id);
+    if (!name || !name[0])
+        return;
+
+    /* Build ONE combined service entry with all available metadata.
+     *
+     * We make a single update_asset_service() call per invocation.  The
+     * port-based dedup in assets.c uses a superset-replacement check so
+     * strings that grow with new metadata ("TLS" → "TLS (foo) [JA4:x]")
+     * replace their shorter predecessor immediately.
+     *
+     * Format examples:
+     *   "TLS (host.example.com) [TLSv1.3] [JA4:t12d18...] [cert:*.example.com/Let's Encrypt]"
+     *   "SSH [client:OpenSSH_9.7] [HASSH-c:abc123] [server:OpenSSH_9.0] [HASSH-s:def456]"
+     *   "HTTP (host.example.com) [Server:nginx/1.24] [UA:Mozilla/5.0...]"
+     *   "Kerberos [domain:CORP.LOCAL] [user:jsmith]"
+     */
+    bstring svc  = bfromcstr(name);
+    bstring appl = bfromcstr(name);
+    if (svc == NULL || appl == NULL) {
+        bdestroy(svc);
+        bdestroy(appl);
+        return;
+    }
+
+    int is_tls = (master == NDPI_PROTOCOL_TLS  || app == NDPI_PROTOCOL_TLS
+               || master == NDPI_PROTOCOL_QUIC || app == NDPI_PROTOCOL_QUIC
+               || master == NDPI_PROTOCOL_DTLS || app == NDPI_PROTOCOL_DTLS);
+    int is_http = (master == NDPI_PROTOCOL_HTTP || app == NDPI_PROTOCOL_HTTP);
+    int is_ssh  = (master == NDPI_PROTOCOL_SSH  || app == NDPI_PROTOCOL_SSH);
+
+    /* ── Hostname (TLS SNI, HTTP Host, etc.) ── */
+    if (flow->host_server_name[0]) {
+        bformata(appl, " (%s)", (char *)flow->host_server_name);
+    }
+
+    /* ── TLS / QUIC / DTLS metadata ── */
+    if (is_tls) {
+        /* TLS version */
+        if (flow->protos.tls_quic.ssl_version) {
+            char ver_buf[24];
+            u_int8_t unknown = 0;
+            ndpi_ssl_version2str(ver_buf, sizeof(ver_buf),
+                                 flow->protos.tls_quic.ssl_version, &unknown);
+            if (!unknown)
+                bformata(appl, " [%s]", ver_buf);
+        }
+
+        /* JA4 client fingerprint */
+        if (flow->protos.tls_quic.ja4_client[0])
+            bformata(appl, " [JA4:%s]", flow->protos.tls_quic.ja4_client);
+
+        /* JA3 server fingerprint */
+        if (flow->protos.tls_quic.ja3_server[0])
+            bformata(appl, " [JA3s:%s]", flow->protos.tls_quic.ja3_server);
+
+        /* Negotiated ALPN (h2, http/1.1, etc.) */
+        if (flow->protos.tls_quic.negotiated_alpn != NULL
+            && flow->protos.tls_quic.negotiated_alpn[0])
+            bformata(appl, " [ALPN:%s]", flow->protos.tls_quic.negotiated_alpn);
+
+        /* Certificate CN/SAN and issuer — compact "cert:CN/Issuer" */
+        if (flow->protos.tls_quic.server_names != NULL
+            && flow->protos.tls_quic.server_names[0]) {
+            if (flow->protos.tls_quic.issuerDN != NULL
+                && flow->protos.tls_quic.issuerDN[0])
+                bformata(appl, " [cert:%s/%s]",
+                         flow->protos.tls_quic.server_names,
+                         flow->protos.tls_quic.issuerDN);
+            else
+                bformata(appl, " [cert:%s]",
+                         flow->protos.tls_quic.server_names);
+        }
+
+        /* Cipher strength warning */
+        if (flow->protos.tls_quic.server_unsafe_cipher == ndpi_cipher_weak)
+            bformata(appl, " [WEAK-CIPHER]");
+        else if (flow->protos.tls_quic.server_unsafe_cipher == ndpi_cipher_insecure)
+            bformata(appl, " [INSECURE-CIPHER]");
+    }
+
+    /* ── SSH metadata ── */
+    if (is_ssh) {
+        if (pi->sc == SC_CLIENT) {
+            if (flow->protos.ssh.client_signature[0])
+                bformata(appl, " [client:%s]", flow->protos.ssh.client_signature);
+            if (flow->protos.ssh.hassh_client[0])
+                bformata(appl, " [HASSH-c:%s]", flow->protos.ssh.hassh_client);
+        } else {
+            if (flow->protos.ssh.server_signature[0])
+                bformata(appl, " [server:%s]", flow->protos.ssh.server_signature);
+            if (flow->protos.ssh.hassh_server[0])
+                bformata(appl, " [HASSH-s:%s]", flow->protos.ssh.hassh_server);
         }
     }
 
-    /* Hostname — surface once when available */
-    if (!(cxt->ndpi_flags & NDPI_FL_HAS_HOST)
-        && flow->host_server_name[0]) {
-        bstring svc = bfromcstr("hostname");
-        bstring val = bfromcstr((char *)flow->host_server_name);
-        update_asset_service(pi, svc, val);
-        cxt->ndpi_flags |= NDPI_FL_HAS_HOST;
+    /* ── HTTP metadata ── */
+    if (is_http) {
+        if (flow->http.server != NULL && flow->http.server[0])
+            bformata(appl, " [Server:%s]", flow->http.server);
+        if (flow->http.user_agent != NULL && pi->sc == SC_CLIENT) {
+            /* Truncate excessively long User-Agents */
+            char ua_buf[257];
+            snprintf(ua_buf, sizeof(ua_buf), "%s", flow->http.user_agent);
+            bformata(appl, " [UA:%s]", ua_buf);
+        }
     }
 
-    /* JA4 — once, only when protocol is TLS/DTLS/QUIC */
-    if (!(cxt->ndpi_flags & NDPI_FL_HAS_JA4)
-        && (master == NDPI_PROTOCOL_TLS || app == NDPI_PROTOCOL_TLS)
-        && flow->protos.tls_quic.ja4_client[0]) {
-        bstring svc = bfromcstr("tls-ja4");
-        bstring val = bfromcstr(flow->protos.tls_quic.ja4_client);
-        update_asset_service(pi, svc, val);
-        cxt->ndpi_flags |= NDPI_FL_HAS_JA4;
+    /* ── Kerberos metadata ── */
+    if (master == NDPI_PROTOCOL_KERBEROS || app == NDPI_PROTOCOL_KERBEROS) {
+        if (flow->protos.kerberos.domain[0])
+            bformata(appl, " [domain:%s]", flow->protos.kerberos.domain);
+        if (flow->protos.kerberos.hostname[0])
+            bformata(appl, " [host:%s]", flow->protos.kerberos.hostname);
+        if (flow->protos.kerberos.username[0])
+            bformata(appl, " [user:%s]", flow->protos.kerberos.username);
     }
 
-    /* HTTP User-Agent — once, only for client direction on HTTP flows */
-    if (!(cxt->ndpi_flags & NDPI_FL_HAS_UA)
-        && (master == NDPI_PROTOCOL_HTTP || app == NDPI_PROTOCOL_HTTP)
-        && flow->http.user_agent != NULL
-        && pi->sc == SC_CLIENT) {
-        bstring svc = bfromcstr("http-useragent");
-        bstring val = bfromcstr(flow->http.user_agent);
-        update_asset_service(pi, svc, val);
-        cxt->ndpi_flags |= NDPI_FL_HAS_UA;
-    }
+    /* ── Security risk flags ── */
+    append_risk_flags(appl, flow->risk);
+
+    update_asset_service(pi, svc, appl);
+    bdestroy(svc);
+    bdestroy(appl);
 }
 
 /* ---- public API -------------------------------------------------------- */
@@ -192,7 +317,11 @@ void ndpi_engine_process_packet(struct _globalconfig *conf, packetinfo *pi)
     struct ndpi_flow_input_info finfo;
     memset(&finfo, 0, sizeof(finfo));
     finfo.in_pkt_dir = (pi->sc == SC_CLIENT) ? 0 : 1;
-    finfo.seen_flow_beginning = (pkt_count <= 1) ? 1 : 0;
+    /* prads always tracks flows from the SYN — tell nDPI we saw the
+     * beginning so it can properly parse TLS ClientHello metadata
+     * (SNI, JA4).  The old (pkt_count <= 1) test was always 0 for TCP
+     * data packets because SYN/SYNACK/ACK are counted first. */
+    finfo.seen_flow_beginning = 1;
 
     ndpi_protocol result = ndpi_detection_process_packet(
         mod, flow, l3_ptr, l3_len, ts_ms, &finfo);

@@ -376,6 +376,24 @@ service_update:
                 log_asset_service(pi->asset,tmp_sa, pi->cxt);
                 return SUCCESS;
 
+            } else if (blength(application) > blength(tmp_sa->application)
+                       && binstr(application, 0, tmp_sa->application) == 0) {
+                /* New application is a strict superset of existing (starts
+                 * with the same prefix but is longer).  This handles nDPI
+                 * progressive enrichment: later packets add metadata
+                 * (hostname, JA4) to the protocol name, e.g.:
+                 *   "TLS" → "TLS (foo.com) [JA4:hash]"
+                 * Allow immediate replacement without i_attempts delay. */
+                tmp_sa->i_attempts = 0;
+                bdestroy(tmp_sa->service);
+                bdestroy(tmp_sa->application);
+                tmp_sa->service = bstrcpy(service);
+                tmp_sa->application = bstrcpy(application);
+                tmp_sa->last_seen = pi->pheader->ts.tv_sec;
+
+                log_asset_service(pi->asset,tmp_sa, pi->cxt);
+                return SUCCESS;
+
             } else if (!(biseq(application, tmp_sa->application) == 1)) {
                 if (tmp_sa->i_attempts > MAX_SERVICE_CHECK) {
                     tmp_sa->i_attempts = 0;
@@ -437,6 +455,12 @@ void add_asset(packetinfo *pi)
 {
     uint64_t hash;
     asset *masset = NULL;
+
+    /* Skip non-routable source IPs — these are not real hosts (e.g. DHCP
+     * DISCOVER from 0.0.0.0, broadcast destinations).  Recording them
+     * pollutes the asset database with noise. */
+    if (pi->af == AF_INET && !pi->arph && PI_IP4SRC(pi) == 0)
+        return;
 
     config.pr_s.assets++;
 
